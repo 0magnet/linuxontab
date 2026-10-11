@@ -2564,7 +2564,7 @@ static void restore_window(XWindow *w) {
  * the apk package that installs it); a file named like a built-in id
  * replaces that entry. An app whose command is missing still shows when it
  * names a package: picking it installs the package in a terminal first. */
-#define MAX_APPS 32
+#define MAX_APPS 48
 typedef struct {
     char id[32];                /* desktop-file id (basename) */
     char name[40];
@@ -2575,6 +2575,9 @@ typedef struct {
     uint32_t color;             /* icon tile, 0xRRGGBB */
     int pinned;                 /* also a taskbar button */
     int installed;              /* command found on PATH (refresh_apps) */
+    char tryexec[48];           /* programs that must be on PATH (space-separated)
+                                 * for "installed", when exec is a wrapper such
+                                 * as sh -c; empty = exec's first word */
 } App;
 
 static const App BUILTIN_APPS[] = {
@@ -2611,6 +2614,19 @@ static const App BUILTIN_APPS[] = {
     { "wolf3d",  "Wolfenstein 3D", "Shareware episode 1",          "wolf3d",                     "wolf3d",   0, 0x9B1C1C, 0, 0 },
     { "tetris",  "Tetris",         "vitetris, in colour",          "tetris",                     "vitetris", 1, 0xC77700, 0, 0 },
     { "xeyes",   "Eyes",           "Eyes that follow the pointer", "xeyes",                      "xeyes",    0, 0x5A5F69, 0, 0 },
+    /* The top Docker Hub server images, as programs: each starts its
+     * server in the background, then opens the page in NetSurf or a
+     * client in a terminal. pkg may name several packages (apk add takes
+     * them all); tryexec lists what must exist for "installed". On lean
+     * every packaged program is an auto-install stub, so each command runs
+     * one of them in the foreground first (php -v, psql -V, ...): two stubs
+     * of one package started together both download and install it. */
+    { "nginx",   "nginx",          "Web server, opens the demo site", "sh -c 'nginx-demo; exec netsurf http://127.0.0.1:8080/'", "nginx netsurf", 0, 0x009639, 0, 0, "nginx-demo netsurf" },
+    { "httpd",   "Apache httpd",   "Web server, opens the demo site", "sh -c 'httpd-demo; exec netsurf http://127.0.0.1:8081/apache.html'", "httpd netsurf", 0, 0xC4282D, 0, 0, "httpd-demo netsurf" },
+    { "php",     "PHP",            "PHP 8.3 web server, opens the demo", "sh -c 'php -v; php-demo >/tmp/php.log 2>&1 & sleep 2; exec netsurf http://127.0.0.1:8082/'", "php netsurf", 0, 0x777BB4, 0, 0, "php-demo netsurf" },
+    { "redis",   "Redis",          "Key/value database + redis-cli", "sh -c 'redis-cli -v; redis-cli ping >/dev/null 2>&1 || redis-server --protected-mode no >/tmp/redis.log 2>&1 & sleep 1; exec redis-cli'", "redis", 1, 0xDC382D, 0, 0, "redis-server redis-cli" },
+    { "postgres","PostgreSQL",     "SQL database server + psql",  "sh -c 'psql -V; postgres-demo >/tmp/postgres.log 2>&1 & echo Starting...; until psql -U postgres -l >/dev/null 2>&1; do sleep 2; done; exec psql -U postgres'", "postgres", 1, 0x336791, 0, 0, "postgres-demo psql" },
+    { "memcached","memcached",     "Memory cache server on :11211", "sh -c 'memcached -V; memcached -u root -l 0.0.0.0 -p 11211 >/tmp/memcached.log 2>&1 & sleep 1; echo Listening on :11211 - try: telnet 127.0.0.1 11211; exec sh'", "memcached", 1, 0x2C7A7B, 0, 0, "memcached" },
 };
 #define NBUILTIN ((int)(sizeof BUILTIN_APPS / sizeof BUILTIN_APPS[0]))
 
@@ -2641,6 +2657,20 @@ static int on_path(const char *cmd) {
     return 0;
 }
 
+/* An app is installed when every tryexec program (or exec's first word) is
+ * on PATH. */
+static int app_installed(const App *a) {
+    if (!a->tryexec[0]) return on_path(a->exec);
+    const char *p = a->tryexec;
+    while (*p) {
+        while (*p == ' ') p++;
+        if (!*p) break;
+        if (!on_path(p)) return 0;
+        while (*p && *p != ' ') p++;
+    }
+    return 1;
+}
+
 static void copy_field(char *dst, size_t cap, const char *src) {
     size_t n = strlen(src);
     while (n && (src[n-1] == '\n' || src[n-1] == '\r' || src[n-1] == ' ')) n--;
@@ -2668,6 +2698,7 @@ static int parse_desktop(const char *path, App *a) {
         else if (!strcmp(k, "Terminal")) a->terminal = !strncmp(v, "true", 4);
         else if (!strcmp(k, "NoDisplay") || !strcmp(k, "Hidden")) hidden |= !strncmp(v, "true", 4);
         else if (!strcmp(k, "X-LinuxOnTab-Package")) copy_field(a->pkg, sizeof a->pkg, v);
+        else if (!strcmp(k, "TryExec")) copy_field(a->tryexec, sizeof a->tryexec, v);
         else if (!strcmp(k, "X-LinuxOnTab-Color")) a->color = (uint32_t)strtoul(v + (*v == '#'), NULL, 16);
         else if (!strcmp(k, "Exec")) {
             /* drop field codes (%f %U ...) — nothing is ever passed */
@@ -2734,7 +2765,7 @@ static void refresh_apps(int force) {
         changed = 1;
     }
     for (int i = 0; i < napps; i++) {
-        int ok = on_path(apps[i].exec);
+        int ok = app_installed(&apps[i]);
         if (ok != apps[i].installed) { apps[i].installed = ok; changed = 1; }
     }
     if (changed && X.srv) rfb_damage_full(X.srv);

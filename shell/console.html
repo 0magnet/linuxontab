@@ -45,9 +45,9 @@
   .stackbar { display: flex; gap: 8px; margin-top: 8px; align-items: center; }
   #msg { color: var(--warn); font-size: 12px; margin-top: 10px; min-height: 1em; }
   .up { color: var(--dim); font-size: 12px; }
-  #images tr[data-run] { cursor: pointer; }
-  #images tr[data-run]:hover td.name { text-decoration: underline; }
-  #images tr[data-run]:hover td { background: #171d25; }
+  #images tr[data-run], #dockerhub tr[data-run] { cursor: pointer; }
+  #images tr[data-run]:hover td.name, #dockerhub tr[data-run]:hover td.name { text-decoration: underline; }
+  #images tr[data-run]:hover td, #dockerhub tr[data-run]:hover td { background: #171d25; }
   .badge { font-size: 11px; color: var(--dim); border: 1px solid var(--line);
            border-radius: 4px; padding: 1px 6px; }
 </style>
@@ -80,6 +80,15 @@
       <thead><tr><th>image</th><th>kind</th><th>size</th><th></th></tr></thead>
       <tbody id="images"></tbody>
     </table>
+  </div>
+
+  <h2>Docker Hub <span class="badge">top images</span></h2>
+  <div class="panel">
+    <table>
+      <thead><tr><th>image</th><th>runs</th><th>size</th><th></th></tr></thead>
+      <tbody id="dockerhub"></tbody>
+    </table>
+    <div class="up" id="dockerhub-missing" style="margin-top:8px"></div>
   </div>
 
   <h2>Stack <span class="badge">compose-style</span></h2>
@@ -251,6 +260,58 @@ const X86APPS = [
     what: 'OpenClaw (npm openclaw, baked in) on x86-64 Node 24 under Blink — run `openclaw onboard` to set it up (slow: tens of minutes)',
     extra: { disk: 'full', xdisk: 'linux-dist/x86-openclaw.ext4', cmd: X86_SETUP + ' && openclaw --version' } },
 ];
+// The most-pulled Docker Hub images, by their Docker names: each row runs a
+// container that does what `docker run <name>` does — the server in the
+// background (service registry) with the page or a client in front, or the
+// image's default program. The tab's ?image= also takes these names
+// (DOCKER_IMAGES in wasm.html), so they work in the run form and stacks.
+// one shell line (each ?cmd= line echoes like a typed command); clear first
+// so the message stands alone, as docker run hello-world's does
+const HELLO = "clear; printf '%s\\n' '' 'Hello from LinuxOnTab!' '' " +
+  "'This container is a Linux kernel compiled to WebAssembly, booted in this browser tab.' " +
+  "'To get here, the console opened a tab, the kernel booted the lean image,' " +
+  "'and the shell ran this command.' '' " +
+  "'Try a server next: the redis, nginx or python rows on the console, or apk add <package>.' ''";
+const DOCKERHUB = [
+  { name: 'busybox', runs: 'lean', image: '', what: 'the lean image is BusyBox: its shell and applets' },
+  { name: 'alpine', runs: 'lean + apk', image: '', what: 'BusyBox with apk, Alpine-style: apk add <package> installs from the LinuxOnTab repository' },
+  { name: 'nginx', runs: 'nginx 1.26', image: 'nginx', extra: { web: 8080, kiosk: '' },
+    what: 'nginx serving the demo site on :8080 — the tab opens on the page' },
+  { name: 'python', runs: 'python 3.11', image: 'python3', extra: { cmd: 'python3' },
+    what: 'the Python 3.11 REPL (pip works too)' },
+  { name: 'redis', runs: 'redis 7.2', image: 'redis', extra: { cmd: 'redis-cli' },
+    what: 'redis-server on :6379, with redis-cli in front' },
+  { name: 'postgres', runs: 'postgres 17', image: 'postgres',
+    extra: { cmd: "echo '[postgres] waiting for the server (the first start runs initdb, about a minute)...'; " +
+                  "until psql -U postgres -l >/dev/null 2>&1; do sleep 2; done; psql -U postgres" },
+    what: 'PostgreSQL 17 on :5432 with psql in front — one client at a time (this build is single-process); other tabs reach it with psql -h <name>' },
+  { name: 'node', runs: 'node (QuickJS)', image: 'nodejs', extra: { cmd: 'node' },
+    what: 'a node-compatible JavaScript REPL on QuickJS (real x86-64 Node 24 is the node-x86 image)' },
+  { name: 'httpd', runs: 'httpd 2.4', image: 'httpd', extra: { web: 8081, kiosk: '' },
+    what: 'Apache httpd serving the demo site on :8081 — the tab opens on the page' },
+  { name: 'php', runs: 'php 8.3', image: 'php', extra: { web: 8082, kiosk: '' },
+    what: 'PHP 8.3 (with PDO/SQLite) serving a demo site with php -S on :8082 — the tab opens on the page' },
+  { name: 'memcached', runs: 'memcached 1.6', image: 'memcached',
+    extra: { cmd: "clear; printf '%s\\n' 'memcached 1.6.45 is listening on :11211 (log: /tmp/svc-memcached.log).' " +
+                  "'Talk to it: telnet 127.0.0.1 11211, then  set k 0 0 5 / hello / get k / stats'" },
+    what: 'memcached on :11211, reachable from the other tabs by its container name' },
+  { name: 'hello-world', runs: 'lean', image: '', extra: { cmd: HELLO },
+    what: 'prints a hello message' },
+];
+const DOCKERHUB_MISSING = 'not here yet: ubuntu (glibc), mongo, mysql and mariadb (multi-process servers ' +
+  'with shared memory), traefik and golang (Go runtime), openjdk, elasticsearch and sonarqube (JVM), ' +
+  'rabbitmq (Erlang), docker (needs a container runtime)';
+function renderDockerHub() {
+  const tb = $('dockerhub');
+  tb.innerHTML = '';
+  for (const d of DOCKERHUB) {
+    tb.appendChild(imageRow(d.name, d.runs, 'on demand', null, d.image, d.name,
+      d.extra, d.what + ' — opens in a new tab'));
+  }
+  $('dockerhub-missing').textContent = DOCKERHUB_MISSING;
+}
+renderDockerHub();
+
 const imgDb = () => new Promise((res, rej) => {
   const rq = indexedDB.open('lot-images', 1);
   rq.onupgradeneeded = () => rq.result.createObjectStore('images', { keyPath: 'name' });

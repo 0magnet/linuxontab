@@ -1,0 +1,1266 @@
+--- a/src/backend/executor/spi.c	2026-10-11 16:09:12
++++ b/src/backend/executor/spi.c	2026-10-11 16:09:12
+@@ -101,6 +101,26 @@
+ {
+ 	int			newdepth;
+ 
++#ifdef LOT_WASM
++#define LOT_MAX_SPI_DEPTH 100
++
++	/*
++	 * LinuxOnTab wasm guest: the browser gives the process a native call
++	 * stack of about 1 MB, which check_stack_depth() cannot see (it measures
++	 * the shadow stack in linear memory, which most frames never touch).
++	 * Nested PL calls are what exhausts it in practice -- the process dies
++	 * at ~140 levels of PL/pgSQL recursion -- so cap SPI nesting and fail
++	 * the way a too-deep recursion does on other platforms.
++	 */
++	if (_SPI_connected + 1 >= LOT_MAX_SPI_DEPTH)
++		ereport(ERROR,
++				(errcode(ERRCODE_STATEMENT_TOO_COMPLEX),
++				 errmsg("stack depth limit exceeded"),
++				 errdetail("Functions that run SQL may nest at most %d levels deep on this platform.",
++						   LOT_MAX_SPI_DEPTH),
++				 errhint("The browser's native call stack is small: rewrite deep recursion as a loop or a recursive CTE.")));
++#endif
++
+ 	/* Enlarge stack if necessary */
+ 	if (_SPI_stack == NULL)
+ 	{
+--- a/src/backend/libpq/pqcomm.c	2026-10-11 16:09:12
++++ b/src/backend/libpq/pqcomm.c	2026-10-11 16:09:12
+@@ -321,6 +321,65 @@
+ 	return port;
+ }
+ 
++#ifdef LOT_WASM
++/*
++ * pq_lot_switch_client - move MyProcPort onto another client connection
++ *
++ * LinuxOnTab single-process server (see tcop/backend_startup.c): the one
++ * backend serves clients one after another.  Rather than rebuilding the Port
++ * and FeBeWaitSet, the new connection is dup2()'d onto the descriptor number
++ * the Port already uses (the poll()-based wait set polls by number).  With
++ * client_sock == NULL the old client is dropped and the number is parked on
++ * /dev/null, so nothing else can claim it in between.
++ */
++void
++pq_lot_switch_client(ClientSocket *client_sock)
++{
++	Port	   *port = MyProcPort;
++	pgsocket	sock = port->sock;
++	int			src;
++
++	src = client_sock ? client_sock->sock : open("/dev/null", O_RDWR);
++	if (src >= 0 && src != sock)
++	{
++		if (dup2(src, sock) < 0)
++			elog(FATAL, "dup2() failed on client socket: %m");
++		close(src);
++	}
++
++	PqSendPointer = PqSendStart = PqRecvPointer = PqRecvLength = 0;
++	PqCommBusy = false;
++	PqCommReadingMsg = false;
++
++	memset(port, 0, sizeof(Port));
++	port->sock = sock;
++	port->remote_host = "";
++	port->remote_port = "";
++	if (client_sock == NULL)
++		return;
++
++	memcpy(&port->raddr.addr, &client_sock->raddr.addr, client_sock->raddr.salen);
++	port->raddr.salen = client_sock->raddr.salen;
++	port->laddr.salen = sizeof(port->laddr.addr);
++	if (getsockname(sock, (struct sockaddr *) &port->laddr.addr,
++					&port->laddr.salen) < 0)
++		elog(LOG, "getsockname() failed: %m");
++	if (port->laddr.addr.ss_family != AF_UNIX)
++	{
++		int			on = 1;
++
++#ifdef TCP_NODELAY
++		(void) setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char *) &on, sizeof(on));
++#endif
++		(void) setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, (char *) &on, sizeof(on));
++	}
++	if (!pg_set_noblock(sock))
++		elog(FATAL, "could not set socket to nonblocking mode: %m");
++	if (fcntl(sock, F_SETFD, FD_CLOEXEC) < 0)
++		elog(FATAL, "fcntl(F_SETFD) failed on socket: %m");
++}
++#endif
++
+ /* --------------------------------
+  *		socket_comm_reset - reset libpq during error recovery
+  *
+--- a/src/backend/main/main.c	2026-10-11 16:09:12
++++ b/src/backend/main/main.c	2026-10-11 16:09:12
+@@ -175,6 +175,13 @@
+ 	 * Make sure we are not running as root, unless it's safe for the selected
+ 	 * option.
+ 	 */
++#ifdef LOT_WASM
++	/*
++	 * LinuxOnTab wasm guest: every process runs as root (setuid() is ENOSYS
++	 * in this kernel), and the guest is a single-user sandbox anyway.
++	 */
++	do_check_root = false;
++#endif
+ 	if (do_check_root)
+ 		check_root(progname);
+ 
+@@ -195,8 +202,26 @@
+ 	else if (argc > 1 && strcmp(argv[1], "--single") == 0)
+ 		PostgresSingleUserMain(argc, argv,
+ 							   strdup(get_user_name_or_exit(progname)));
++#ifdef LOT_WASM
+ 	else
++	{
++		/*
++		 * LinuxOnTab wasm guest: there is no shared memory between processes
++		 * (each is its own wasm instance), so the postmaster's
++		 * fork-per-connection model cannot work.  Instead, run a standalone
++		 * backend that listens itself and serves one client at a time (see
++		 * lot_server_* in tcop/backend_startup.c).  Same switches as the
++		 * postmaster (-D, -p, -h, -k, -c ...); default database "postgres".
++		 */
++		extern bool lot_server_mode;
++
++		lot_server_mode = true;
++		PostgresSingleUserMain(argc, argv, "postgres");
++	}
++#else
++	else
+ 		PostmasterMain(argc, argv);
++#endif
+ 	/* the functions above should not return */
+ 	abort();
+ }
+--- a/src/backend/port/sysv_shmem.c	2026-10-11 16:09:12
++++ b/src/backend/port/sysv_shmem.c	2026-10-11 16:09:12
+@@ -316,6 +316,9 @@
+ bool
+ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
+ {
++#ifdef LOT_WASM
++	return false;				/* no System V segments on this target */
++#endif
+ 	PGShmemHeader *memAddress;
+ 	IpcMemoryState state;
+ 
+@@ -733,6 +736,41 @@
+ 
+ 	/* Room for a header? */
+ 	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
++
++#ifdef LOT_WASM
++
++	/*
++	 * LinuxOnTab wasm guest: the kernel has no System V IPC, and every
++	 * process is its own wasm instance, so nothing could share a segment
++	 * anyway.  The only server mode on this target is one process (see
++	 * lot_server_* in tcop/backend_startup.c), so "shared" memory is plain
++	 * process memory.
++	 */
++	memAddress = NULL;
++	if (posix_memalign(&memAddress, 65536, size) != 0 || memAddress == NULL)
++		ereport(FATAL,
++				(errcode(ERRCODE_OUT_OF_MEMORY),
++				 errmsg("could not allocate shared memory segment of %zu bytes",
++						size),
++				 errhint("Reduce \"shared_buffers\" or \"max_connections\".")));
++	memset(memAddress, 0, size);
++	SetConfigOption("huge_pages_status", "off",
++					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
++	hdr = (PGShmemHeader *) memAddress;
++	hdr->creatorPID = getpid();
++	hdr->magic = PGShmemMagic;
++	hdr->dsm_control = 0;
++	hdr->device = statbuf.st_dev;
++	hdr->inode = statbuf.st_ino;
++	hdr->totalsize = size;
++	hdr->freeoffset = MAXALIGN(sizeof(PGShmemHeader));
++	*shim = hdr;
++	UsedShmemSegAddr = NULL;	/* nothing to shmdt() */
++	UsedShmemSegID = 0;
++	(void) sysvsize;
++	(void) NextShmemSegID;
++	return hdr;
++#endif
+ 
+ 	if (shared_memory_type == SHMEM_TYPE_MMAP)
+ 	{
+--- a/src/backend/storage/ipc/dsm_impl.c	2026-10-11 16:09:12
++++ b/src/backend/storage/ipc/dsm_impl.c	2026-10-11 16:09:12
+@@ -155,6 +155,92 @@
+  * silently return false.
+  *-----
+  */
++#ifdef LOT_WASM
++/*
++ * LinuxOnTab wasm guest: every process is a separate wasm instance with no
++ * memory shared between them (MAP_SHARED and shm_open cannot share), and
++ * the only server mode on this target runs in one process.  So a dynamic
++ * shared memory segment is a block of this process's memory, found again by
++ * handle.  Whatever dynamic_shared_memory_type says, this is what runs.
++ */
++typedef struct lot_dsm_seg
++{
++	struct lot_dsm_seg *next;
++	dsm_handle	handle;
++	void	   *address;
++	Size		size;
++} lot_dsm_seg;
++
++static lot_dsm_seg *lot_dsm_segs = NULL;
++
++static bool
++dsm_impl_lot(dsm_op op, dsm_handle handle, Size request_size,
++			 void **impl_private, void **mapped_address, Size *mapped_size,
++			 int elevel)
++{
++	lot_dsm_seg **link;
++	lot_dsm_seg *seg;
++
++	for (link = &lot_dsm_segs; (seg = *link) != NULL; link = &seg->next)
++		if (seg->handle == handle)
++			break;
++
++	switch (op)
++	{
++		case DSM_OP_CREATE:
++			if (seg != NULL)
++				return false;	/* name collision: caller picks another */
++			seg = malloc(sizeof(lot_dsm_seg));
++			if (seg == NULL ||
++				posix_memalign(&seg->address, 65536, request_size) != 0)
++			{
++				free(seg);
++				ereport(elevel,
++						(errcode(ERRCODE_OUT_OF_MEMORY),
++						 errmsg("could not allocate dynamic shared memory segment of %zu bytes",
++								request_size)));
++				return false;
++			}
++			memset(seg->address, 0, request_size);
++			seg->handle = handle;
++			seg->size = request_size;
++			seg->next = lot_dsm_segs;
++			lot_dsm_segs = seg;
++			*mapped_address = seg->address;
++			*mapped_size = seg->size;
++			return true;
++		case DSM_OP_ATTACH:
++			if (seg == NULL)
++			{
++				errno = ENOENT;
++				ereport(elevel,
++						(errcode_for_dynamic_shared_memory(),
++						 errmsg("could not open shared memory segment \"%u\": %m",
++								handle)));
++				return false;
++			}
++			*mapped_address = seg->address;
++			*mapped_size = seg->size;
++			return true;
++		case DSM_OP_DETACH:
++			*mapped_address = NULL;
++			*mapped_size = 0;
++			return true;
++		case DSM_OP_DESTROY:
++			*mapped_address = NULL;
++			*mapped_size = 0;
++			if (seg != NULL)
++			{
++				*link = seg->next;
++				free(seg->address);
++				free(seg);
++			}
++			return true;
++	}
++	return false;
++}
++#endif
++
+ bool
+ dsm_impl_op(dsm_op op, dsm_handle handle, Size request_size,
+ 			void **impl_private, void **mapped_address, Size *mapped_size,
+@@ -163,6 +249,10 @@
+ 	Assert(op == DSM_OP_CREATE || request_size == 0);
+ 	Assert((op != DSM_OP_CREATE && op != DSM_OP_ATTACH) ||
+ 		   (*mapped_address == NULL && *mapped_size == 0));
++#ifdef LOT_WASM
++	return dsm_impl_lot(op, handle, request_size, impl_private,
++						mapped_address, mapped_size, elevel);
++#endif
+ 
+ 	switch (dynamic_shared_memory_type)
+ 	{
+--- a/src/backend/tcop/backend_startup.c	2026-10-11 16:09:12
++++ b/src/backend/tcop/backend_startup.c	2026-10-11 16:09:12
+@@ -920,3 +920,464 @@
+ {
+ 	_exit(1);
+ }
++
++#ifdef LOT_WASM
++/* ----------------------------------------------------------------
++ * LinuxOnTab single-process server, connection side
++ *
++ * The LinuxOnTab wasm guest has no memory shared between processes (each
++ * one is a separate wasm instance), so the postmaster cannot fork backends.
++ * main.c runs a stand-alone backend in "server mode" instead: it listens on
++ * listen_addresses/port and unix_socket_directories itself, and serves one
++ * client at a time over the normal FE/BE protocol (postgres.c drives the
++ * session side).  Further clients wait in the listen backlog; an idle
++ * session (no open transaction) is ended when another client connects, so
++ * psql's \connect (which opens the new connection before closing the old
++ * one) and abandoned idle connections don't block everyone.  A client
++ * asking for another database makes the server shut down cleanly and
++ * re-exec itself for that database, handing over the sockets.  Clients are
++ * trusted: no pg_hba.conf, any existing login role.
++ * ----------------------------------------------------------------
++ */
++#include <fcntl.h>
++#include <poll.h>
++#include "utils/varlena.h"
++#include "utils/wait_event.h"
++
++#define LOT_MAXLISTEN 8
++
++bool		lot_demote_fatal = false;
++static pgsocket lot_listen_socks[LOT_MAXLISTEN];
++static int	lot_nlisten = 0;
++static WaitEventSet *lot_accept_set = NULL;
++static WaitEventSet *lot_idle_set = NULL;
++static ClientSocket lot_pending;	/* accepted while a session was idle */
++static bool lot_have_pending = false;
++static bool lot_handing_off = false;
++static char **lot_handoff_argv = NULL;
++
++static void
++lot_server_close_listen(int code, Datum arg)
++{
++	for (int i = 0; i < lot_nlisten; i++)
++		closesocket(lot_listen_socks[i]);
++	lot_nlisten = 0;
++	/* a re-exec for another database keeps serving on the same sockets */
++	if (!lot_handing_off)
++		RemoveSocketFiles();
++}
++
++/* Open the listen sockets, like PostmasterMain does. */
++void
++lot_server_listen(void)
++{
++	char	   *rawstring;
++	List	   *elemlist;
++	ListCell   *l;
++	char	   *inherited = getenv("LOT_PG_LISTEN_FDS");
++
++	if (inherited != NULL)
++	{
++		/* re-exec'd for another database: sockets handed over */
++		rawstring = pstrdup(inherited);
++		for (char *tok = strtok(rawstring, ","); tok; tok = strtok(NULL, ","))
++			if (lot_nlisten < LOT_MAXLISTEN)
++				lot_listen_socks[lot_nlisten++] = atoi(tok);
++		unsetenv("LOT_PG_LISTEN_FDS");
++	}
++	else
++	{
++		if (ListenAddresses && ListenAddresses[0] != '\0')
++		{
++			rawstring = pstrdup(ListenAddresses);
++			if (!SplitGUCList(rawstring, ',', &elemlist))
++				ereport(FATAL,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("invalid list syntax in parameter \"%s\"",
++								"listen_addresses")));
++			foreach(l, elemlist)
++			{
++				char	   *curhost = (char *) lfirst(l);
++
++				if (ListenServerPort(AF_UNSPEC,
++									 strcmp(curhost, "*") == 0 ? NULL : curhost,
++									 (unsigned short) PostPortNumber, NULL,
++									 lot_listen_socks, &lot_nlisten,
++									 LOT_MAXLISTEN) != STATUS_OK)
++					ereport(WARNING,
++							(errmsg("could not create listen socket for \"%s\"",
++									curhost)));
++			}
++		}
++
++		if (Unix_socket_directories && Unix_socket_directories[0] != '\0')
++		{
++			rawstring = pstrdup(Unix_socket_directories);
++			if (!SplitDirectoriesString(rawstring, ',', &elemlist))
++				ereport(FATAL,
++						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
++						 errmsg("invalid list syntax in parameter \"%s\"",
++								"unix_socket_directories")));
++			foreach(l, elemlist)
++			{
++				char	   *socketdir = (char *) lfirst(l);
++
++				if (ListenServerPort(AF_UNIX, NULL,
++									 (unsigned short) PostPortNumber, socketdir,
++									 lot_listen_socks, &lot_nlisten,
++									 LOT_MAXLISTEN) != STATUS_OK)
++					ereport(WARNING,
++							(errmsg("could not create Unix-domain socket in directory \"%s\"",
++									socketdir)));
++			}
++		}
++	}
++
++	if (lot_nlisten == 0)
++		ereport(FATAL,
++				(errmsg("no socket created for listening")));
++	on_proc_exit(lot_server_close_listen, 0);
++
++	for (int i = 0; i < lot_nlisten; i++)
++	{
++		(void) pg_set_noblock(lot_listen_socks[i]);
++		(void) fcntl(lot_listen_socks[i], F_SETFD, FD_CLOEXEC);
++	}
++}
++
++/* adopt a client the previous server process accepted (database switch) */
++static Port *
++lot_adopt_handoff_client(void)
++{
++	char	   *fdstr = getenv("LOT_PG_CLIENT_FD");
++	ClientSocket client_sock;
++	MemoryContext oldcxt;
++	Port	   *port;
++	char	   *gucs;
++
++	if (fdstr == NULL)
++		return NULL;
++	memset(&client_sock, 0, sizeof(client_sock));
++	client_sock.sock = atoi(fdstr);
++	client_sock.raddr.salen = sizeof(client_sock.raddr.addr);
++	if (getpeername(client_sock.sock, (struct sockaddr *) &client_sock.raddr.addr,
++					&client_sock.raddr.salen) < 0)
++		client_sock.raddr.salen = 0;
++
++	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
++	ReserveExternalFD();
++	port = MyProcPort = pq_init(&client_sock);
++	port->remote_host = "";
++	port->remote_port = "";
++	port->user_name = pstrdup(getenv("LOT_PG_USER") ? getenv("LOT_PG_USER") : "postgres");
++	port->database_name = pstrdup(getenv("LOT_PG_DB") ? getenv("LOT_PG_DB") : "postgres");
++	gucs = getenv("LOT_PG_GUCS");
++	if (gucs != NULL && gucs[0] != '\0')
++	{
++		char	   *s = pstrdup(gucs);
++		char	   *p = s;
++
++		/* name \001 value \001 name \001 value ... */
++		while (p && *p)
++		{
++			char	   *sep = strchr(p, '\001');
++
++			if (sep)
++				*sep = '\0';
++			port->guc_options = lappend(port->guc_options, pstrdup(p));
++			p = sep ? sep + 1 : NULL;
++		}
++		if (list_length(port->guc_options) % 2 != 0)
++			port->guc_options = NIL;
++	}
++	if (getenv("LOT_PG_PROTO"))
++		FrontendProtocol = (ProtocolVersion) strtoul(getenv("LOT_PG_PROTO"), NULL, 10);
++	MemoryContextSwitchTo(oldcxt);
++
++	unsetenv("LOT_PG_CLIENT_FD");
++	unsetenv("LOT_PG_USER");
++	unsetenv("LOT_PG_DB");
++	unsetenv("LOT_PG_GUCS");
++	unsetenv("LOT_PG_PROTO");
++	whereToSendOutput = DestRemote;
++	return port;
++}
++
++/*
++ * Wait for the next client, then read its startup packet.  Returns with
++ * MyProcPort describing the client and whereToSendOutput = DestRemote.
++ * Cancel requests, SSL attempts and broken startup packets are answered
++ * (or dropped) here and never returned.
++ */
++Port *
++lot_server_accept(void)
++{
++	Port	   *handoff = lot_adopt_handoff_client();
++
++	if (handoff != NULL)
++		return handoff;
++
++	/*
++	 * Built lazily: MyLatch must already be the shared PGPROC latch, which
++	 * InitProcess() switches to.
++	 */
++	if (lot_accept_set == NULL)
++	{
++		lot_accept_set = CreateWaitEventSet(NULL, lot_nlisten + 1);
++		AddWaitEventToSet(lot_accept_set, WL_LATCH_SET, PGINVALID_SOCKET,
++						  MyLatch, NULL);
++		for (int i = 0; i < lot_nlisten; i++)
++			AddWaitEventToSet(lot_accept_set, WL_SOCKET_ACCEPT,
++							  lot_listen_socks[i], NULL, NULL);
++	}
++
++	for (;;)
++	{
++		WaitEvent	event;
++		ClientSocket client_sock;
++		Port	   *port;
++		char		remote_host[NI_MAXHOST];
++		char		remote_port[NI_MAXSERV];
++		MemoryContext oldcxt;
++		volatile int status;
++
++		if (lot_have_pending)
++		{
++			client_sock = lot_pending;
++			lot_have_pending = false;
++		}
++		else
++		{
++			set_ps_display("waiting for client");
++			if (WaitEventSetWait(lot_accept_set, -1, &event, 1,
++								 WAIT_EVENT_CLIENT_READ) != 1)
++				continue;
++			if (event.events & WL_LATCH_SET)
++			{
++				ResetLatch(MyLatch);
++				CHECK_FOR_INTERRUPTS();
++				continue;
++			}
++			if (!(event.events & WL_SOCKET_ACCEPT))
++				continue;
++			if (AcceptConnection(event.fd, &client_sock) != STATUS_OK)
++				continue;
++		}
++
++		if (MyProcPort == NULL)
++		{
++			oldcxt = MemoryContextSwitchTo(TopMemoryContext);
++			ReserveExternalFD();
++			MyProcPort = pq_init(&client_sock);
++			MemoryContextSwitchTo(oldcxt);
++		}
++		else
++			pq_lot_switch_client(&client_sock);
++		port = MyProcPort;
++
++		remote_host[0] = '\0';
++		remote_port[0] = '\0';
++		(void) pg_getnameinfo_all(&port->raddr.addr, port->raddr.salen,
++								  remote_host, sizeof(remote_host),
++								  remote_port, sizeof(remote_port),
++								  NI_NUMERICHOST | NI_NUMERICSERV);
++		port->remote_host = MemoryContextStrdup(TopMemoryContext, remote_host);
++		port->remote_port = MemoryContextStrdup(TopMemoryContext, remote_port);
++
++		whereToSendOutput = DestRemote;
++		ClientAuthInProgress = true;
++		lot_demote_fatal = true;
++		set_ps_display("startup");
++
++		oldcxt = CurrentMemoryContext;
++		PG_TRY();
++		{
++			status = ProcessSSLStartup(port);
++			if (status == STATUS_OK)
++				status = ProcessStartupPacket(port, false, false);
++			if (status == STATUS_OK && am_walsender)
++			{
++				am_walsender = false;
++				ereport(ERROR,
++						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
++						 errmsg("replication connections are not supported by this single-process server")));
++			}
++		}
++		PG_CATCH();
++		{
++			MemoryContextSwitchTo(oldcxt);
++			EmitErrorReport();
++			FlushErrorState();
++			status = STATUS_ERROR;
++		}
++		PG_END_TRY();
++		lot_demote_fatal = false;
++		ClientAuthInProgress = false;
++
++		if (status == STATUS_OK)
++		{
++			set_ps_display("idle");
++			return port;
++		}
++
++		/* rejected, cancel request, or the client went away */
++		pq_flush();
++		whereToSendOutput = DestNone;
++		pq_lot_switch_client(NULL);
++	}
++}
++
++/*
++ * Is the connection just accepted on fd a cancel request?  (Those arrive
++ * on a new connection; with one process there is never a running query
++ * left to cancel by the time we read it.)  Consumes and drops it if so.
++ */
++static bool
++lot_is_cancel_request(pgsocket fd)
++{
++	struct pollfd pfd;
++	uint32		hdr[4];
++	ssize_t		n;
++
++	pfd.fd = fd;
++	pfd.events = POLLIN;
++	pfd.revents = 0;
++	if (poll(&pfd, 1, 1000) <= 0)
++		return false;			/* nothing sent yet: treat as a real client */
++	n = recv(fd, hdr, sizeof(hdr), MSG_PEEK);
++	if (n < 8)
++		return false;
++	if (pg_ntoh32(hdr[0]) == 16 &&
++		pg_ntoh32(hdr[1]) == (uint32) CANCEL_REQUEST_CODE)
++	{
++		(void) recv(fd, hdr, sizeof(hdr), 0);
++		return true;
++	}
++	return false;
++}
++
++/*
++ * Called by PostgresMain when the current client is idle (ReadyForQuery
++ * sent, no transaction open): wait until it sends something, or until
++ * another client connects.  In the latter case the idle session is ended
++ * (FATAL 57P01 sent to it) and true is returned; the waiting client is
++ * picked up by the next lot_server_accept().
++ */
++bool
++lot_server_wait_idle(void)
++{
++	if (pq_buffer_remaining_data() > 0 || MyProcPort == NULL)
++		return false;
++
++	if (lot_idle_set == NULL)
++	{
++		/* the client descriptor number never changes (pq_lot_switch_client) */
++		lot_idle_set = CreateWaitEventSet(NULL, lot_nlisten + 2);
++		AddWaitEventToSet(lot_idle_set, WL_LATCH_SET, PGINVALID_SOCKET,
++						  MyLatch, NULL);
++		AddWaitEventToSet(lot_idle_set, WL_SOCKET_READABLE, MyProcPort->sock,
++						  NULL, NULL);
++		for (int i = 0; i < lot_nlisten; i++)
++			AddWaitEventToSet(lot_idle_set, WL_SOCKET_ACCEPT,
++							  lot_listen_socks[i], NULL, NULL);
++	}
++
++	for (;;)
++	{
++		WaitEvent	event;
++		StringInfoData buf;
++
++		if (WaitEventSetWait(lot_idle_set, -1, &event, 1,
++							 WAIT_EVENT_CLIENT_READ) != 1)
++			continue;
++		if (event.events & WL_LATCH_SET)
++		{
++			ResetLatch(MyLatch);
++			CHECK_FOR_INTERRUPTS();
++			continue;
++		}
++		if (event.pos == 1)
++			return false;		/* the current client has something to say */
++		if (AcceptConnection(event.fd, &lot_pending) != STATUS_OK)
++			continue;
++		if (lot_is_cancel_request(lot_pending.sock))
++		{
++			closesocket(lot_pending.sock);
++			continue;
++		}
++		lot_have_pending = true;
++
++		/* say goodbye like a terminated backend would */
++		pq_beginmessage(&buf, PqMsg_ErrorResponse);
++		pq_sendbyte(&buf, PG_DIAG_SEVERITY);
++		pq_sendstring(&buf, "FATAL");
++		pq_sendbyte(&buf, PG_DIAG_SEVERITY_NONLOCALIZED);
++		pq_sendstring(&buf, "FATAL");
++		pq_sendbyte(&buf, PG_DIAG_SQLSTATE);
++		pq_sendstring(&buf, "57P01");
++		pq_sendbyte(&buf, PG_DIAG_MESSAGE_PRIMARY);
++		pq_sendstring(&buf, "terminating idle session: another client connected");
++		pq_sendbyte(&buf, PG_DIAG_MESSAGE_DETAIL);
++		pq_sendstring(&buf, "This single-process PostgreSQL serves one client at a time.");
++		pq_sendbyte(&buf, '\0');
++		pq_endmessage(&buf);
++		(void) pq_flush();
++		elog(LOG, "ending idle session: another client connected");
++		return true;
++	}
++}
++
++static void
++lot_handoff_exec(void)
++{
++	if (!lot_handing_off)
++		return;
++	fflush(NULL);
++	execv(my_exec_path, lot_handoff_argv);
++	write_stderr("could not re-execute \"%s\" for the database switch: %s\n",
++				 my_exec_path, strerror(errno));
++}
++
++/*
++ * The client asked for a database other than the one this process is
++ * attached to (a backend can only ever attach to one).  Shut down cleanly
++ * and re-exec for that database, handing over the listen sockets and this
++ * client (whose startup packet has been read already).  Does not return.
++ */
++void
++lot_server_handoff(Port *port, char **argv)
++{
++	StringInfoData s;
++	ListCell   *l;
++	char		num[32];
++
++	ereport(LOG,
++			(errmsg("restarting for database \"%s\" (one database per server process)",
++					port->database_name)));
++
++	initStringInfo(&s);
++	for (int i = 0; i < lot_nlisten; i++)
++		appendStringInfo(&s, "%d,", dup(lot_listen_socks[i]));	/* no CLOEXEC */
++	setenv("LOT_PG_LISTEN_FDS", s.data, 1);
++	snprintf(num, sizeof(num), "%d", dup(port->sock));
++	setenv("LOT_PG_CLIENT_FD", num, 1);
++	snprintf(num, sizeof(num), "%u", (unsigned int) FrontendProtocol);
++	setenv("LOT_PG_PROTO", num, 1);
++	setenv("LOT_PG_USER", port->user_name, 1);
++	setenv("LOT_PG_DB", port->database_name, 1);
++	resetStringInfo(&s);
++	foreach(l, port->guc_options)
++	{
++		if (s.len > 0)
++			appendStringInfoChar(&s, '\001');
++		appendStringInfoString(&s, (char *) lfirst(l));
++	}
++	setenv("LOT_PG_GUCS", s.data, 1);
++
++	lot_handoff_argv = argv;
++	lot_handing_off = true;
++	atexit(lot_handoff_exec);
++	whereToSendOutput = DestNone;
++	proc_exit(0);
++}
++#endif							/* LOT_WASM */
+--- a/src/backend/tcop/postgres.c	2026-10-11 16:09:12
++++ b/src/backend/tcop/postgres.c	2026-10-11 16:09:12
+@@ -81,7 +81,21 @@
+ #include "utils/timeout.h"
+ #include "utils/timestamp.h"
+ #include "utils/varlena.h"
++#ifdef LOT_WASM
++#include "access/htup_details.h"
++#include "catalog/pg_authid.h"
++#include "catalog/pg_database.h"
++#include "commands/dbcommands.h"
++#include "libpq/protocol.h"
++#include "utils/acl.h"
++#include "utils/syscache.h"
++#endif
+ 
++#ifdef LOT_WASM
++/* LinuxOnTab single-process server: see lot_end_client() & co. below */
++static char **lot_argv = NULL;
++#endif
++
+ /* ----------------
+  *		global variables
+  * ----------------
+@@ -3344,6 +3358,16 @@
+ 		LockErrorCleanup();
+ 		/* don't send to client, we already know the connection to be dead. */
+ 		whereToSendOutput = DestNone;
++#ifdef LOT_WASM
++		/* single-process server: drop this client, keep serving */
++		if (lot_server_mode)
++		{
++			ClientConnectionLost = false;
++			ereport(ERROR,
++					(errcode(ERRCODE_CONNECTION_FAILURE),
++					 errmsg("connection to client lost")));
++		}
++#endif
+ 		ereport(FATAL,
+ 				(errcode(ERRCODE_CONNECTION_FAILURE),
+ 				 errmsg("connection to client lost")));
+@@ -4165,6 +4189,11 @@
+ 	 * Parse command-line options.
+ 	 */
+ 	process_postgres_switches(argc, argv, PGC_POSTMASTER, &dbname);
++#ifdef LOT_WASM
++	/* re-exec'd by lot_server_handoff() for another database */
++	if (lot_server_mode && getenv("LOT_PG_DB") != NULL)
++		dbname = strdup(getenv("LOT_PG_DB"));
++#endif
+ 
+ 	/* Must have gotten a database name, or have a default (the username) */
+ 	if (dbname == NULL)
+@@ -4236,6 +4265,16 @@
+ 	 */
+ 	InitProcess();
+ 
++#ifdef LOT_WASM
++	if (lot_server_mode)
++	{
++		/* no stand-alone console: output goes to clients, errors to stderr */
++		whereToSendOutput = DestNone;
++		lot_argv = argv;
++		lot_server_listen();
++	}
++#endif
++
+ 	/*
+ 	 * Now that sufficient infrastructure has been initialized, PostgresMain()
+ 	 * can do the rest.
+@@ -4244,7 +4283,174 @@
+ }
+ 
+ 
++#ifdef LOT_WASM
+ /* ----------------------------------------------------------------
++ * LinuxOnTab single-process server, session side
++ *
++ * On the LinuxOnTab wasm guest every process is a separate wasm instance and
++ * nothing is shared between them, so the postmaster cannot fork backends that
++ * share a buffer pool.  Instead main.c runs a stand-alone backend in "server
++ * mode": it listens on the usual TCP/Unix sockets itself and serves one
++ * client at a time over the normal FE/BE protocol.  A client's disconnect
++ * ends its session (open transaction rolled back, then the equivalent of
++ * DISCARD ALL) and the next queued client is accepted.  The accept/startup
++ * packet side lives in backend_startup.c.
++ * ----------------------------------------------------------------
++ */
++bool		lot_server_mode = false;
++static bool lot_client_attached = false;
++static char *lot_dbname = NULL;
++
++/* drop the current client and forget its session state */
++static void
++lot_end_client(void)
++{
++	whereToSendOutput = DestNone;
++	lot_client_attached = false;
++	pq_lot_switch_client(NULL);
++	disable_all_timeouts(false);
++	QueryCancelPending = false;
++	AbortOutOfAnyTransaction();
++	exec_simple_query("DISCARD ALL");
++}
++
++/* role, options and greeting for a freshly accepted client */
++static void
++lot_session_setup(Port *port)
++{
++	Oid			roleid;
++	HeapTuple	roleTup;
++	ListCell   *gucopts;
++	StringInfoData buf;
++
++	StartTransactionCommand();
++
++	/* trust authentication: any existing role that may log in */
++	roleid = get_role_oid(port->user_name, true);
++	if (!OidIsValid(roleid))
++		ereport(ERROR,
++				(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
++				 errmsg("role \"%s\" does not exist", port->user_name)));
++	roleTup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
++	if (HeapTupleIsValid(roleTup))
++	{
++		bool		canlogin = ((Form_pg_authid) GETSTRUCT(roleTup))->rolcanlogin;
++
++		ReleaseSysCache(roleTup);
++		if (!canlogin)
++			ereport(ERROR,
++					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
++					 errmsg("role \"%s\" is not permitted to log in",
++							port->user_name)));
++	}
++
++	/* a backend attaches to one database for life: re-exec for another */
++	if (strcmp(port->database_name, lot_dbname) != 0)
++	{
++		Oid			dboid = get_database_oid(port->database_name, true);
++		HeapTuple	dbTup;
++		bool		allowconn = false;
++
++		if (!OidIsValid(dboid))
++			ereport(ERROR,
++					(errcode(ERRCODE_UNDEFINED_DATABASE),
++					 errmsg("database \"%s\" does not exist",
++							port->database_name)));
++		dbTup = SearchSysCache1(DATABASEOID, ObjectIdGetDatum(dboid));
++		if (HeapTupleIsValid(dbTup))
++		{
++			allowconn = ((Form_pg_database) GETSTRUCT(dbTup))->datallowconn;
++			ReleaseSysCache(dbTup);
++		}
++		if (!allowconn)
++			ereport(ERROR,
++					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
++					 errmsg("database \"%s\" is not currently accepting connections",
++							port->database_name)));
++		CommitTransactionCommand();
++		lot_server_handoff(port, lot_argv);
++	}
++
++	if (roleid != GetAuthenticatedUserId())
++		SetConfigOption("session_authorization", port->user_name,
++						PGC_SUSET, PGC_S_SESSION);
++
++	if (port->cmdline_options != NULL && port->cmdline_options[0] != '\0')
++		ereport(WARNING,
++				(errmsg("startup \"options\" are ignored by this server: %s",
++						port->cmdline_options)));
++
++	/* GUC settings from the startup packet (client_encoding, ...) */
++	gucopts = list_head(port->guc_options);
++	while (gucopts)
++	{
++		char	   *name;
++		char	   *value;
++
++		name = lfirst(gucopts);
++		gucopts = lnext(port->guc_options, gucopts);
++		value = lfirst(gucopts);
++		gucopts = lnext(port->guc_options, gucopts);
++		(void) set_config_option(name, value, PGC_SUSET, PGC_S_SESSION,
++								 GUC_ACTION_SET, true, WARNING, false);
++	}
++
++	CommitTransactionCommand();
++
++	pq_beginmessage(&buf, PqMsg_AuthenticationRequest);
++	pq_sendint32(&buf, (int32) AUTH_REQ_OK);
++	pq_endmessage(&buf);
++
++	BeginReportingGUCOptions();
++
++	pq_beginmessage(&buf, PqMsg_BackendKeyData);
++	pq_sendint32(&buf, (int32) MyProcPid);
++	pq_sendint32(&buf, (int32) MyCancelKey);
++	pq_endmessage(&buf);
++	/* ReadyForQuery (from the main loop) flushes */
++}
++
++/* block until the next client has connected and been greeted */
++static void
++lot_start_client(void)
++{
++	for (;;)
++	{
++		Port	   *port = lot_server_accept();
++		MemoryContext oldcxt = CurrentMemoryContext;
++		volatile bool ok = true;
++
++		lot_client_attached = true;
++		PG_TRY();
++		{
++			lot_session_setup(port);
++		}
++		PG_CATCH();
++		{
++			MemoryContextSwitchTo(oldcxt);
++			EmitErrorReport();
++			FlushErrorState();
++			ok = false;
++		}
++		PG_END_TRY();
++		if (ok)
++		{
++			if (port->remote_port[0] != '\0')
++				elog(LOG, "client connected: user=%s database=%s host=%s port=%s",
++					 port->user_name, port->database_name,
++					 port->remote_host, port->remote_port);
++			else
++				elog(LOG, "client connected: user=%s database=%s (local socket)",
++					 port->user_name, port->database_name);
++			return;
++		}
++		pq_flush();
++		lot_end_client();
++	}
++}
++#endif
++
++/* ----------------------------------------------------------------
+  * PostgresMain
+  *	   postgres main loop -- all backends, interactive or otherwise loop here
+  *
+@@ -4264,6 +4470,9 @@
+ 	volatile bool send_ready_for_query = true;
+ 	volatile bool idle_in_transaction_timeout_enabled = false;
+ 	volatile bool idle_session_timeout_enabled = false;
++#ifdef LOT_WASM
++	volatile bool lot_sent_rfq = false;
++#endif
+ 
+ 	Assert(dbname != NULL);
+ 	Assert(username != NULL);
+@@ -4291,6 +4500,15 @@
+ 	{
+ 		pqsignal(SIGHUP, SignalHandlerForConfigReload);
+ 		pqsignal(SIGINT, StatementCancelHandler);	/* cancel current query */
++#ifdef LOT_WASM
++		/*
++		 * Single-process server: no client can send a cancel request while
++		 * a query runs, so SIGINT (Ctrl-C on its console) means "shut down",
++		 * like a postmaster's fast shutdown.
++		 */
++		if (lot_server_mode)
++			pqsignal(SIGINT, die);
++#endif
+ 		pqsignal(SIGTERM, die); /* cancel current query and exit */
+ 
+ 		/*
+@@ -4345,6 +4563,16 @@
+ 				 username, InvalidOid,	/* role to connect as */
+ 				 (!am_walsender) ? INIT_PG_LOAD_SESSION_LIBS : 0,
+ 				 NULL);			/* no out_dbname */
++#ifdef LOT_WASM
++	if (lot_server_mode)
++	{
++		lot_dbname = MemoryContextStrdup(TopMemoryContext, dbname);
++		ereport(LOG,
++				(errmsg("database system is ready to accept connections"),
++				 errdetail("Single-process server for database \"%s\": one client at a time.",
++						   dbname)));
++	}
++#endif
+ 
+ 	/*
+ 	 * If the PostmasterContext is still around, recycle the space; we don't
+@@ -4548,9 +4776,17 @@
+ 		 * connection anymore.
+ 		 */
+ 		if (pq_is_reading_msg())
+-			ereport(FATAL,
+-					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+-					 errmsg("terminating connection because protocol synchronization was lost")));
++		{
++#ifdef LOT_WASM
++			/* single-process server: drop only this client */
++			if (lot_server_mode)
++				whereToSendOutput = DestNone;
++			else
++#endif
++				ereport(FATAL,
++						(errcode(ERRCODE_PROTOCOL_VIOLATION),
++						 errmsg("terminating connection because protocol synchronization was lost")));
++		}
+ 
+ 		/* Now we can allow interrupts again */
+ 		RESUME_INTERRUPTS();
+@@ -4577,6 +4813,19 @@
+ 		 */
+ 		doing_extended_query_message = false;
+ 
++#ifdef LOT_WASM
++		/* single-process server: (re)attach to the next client */
++		if (lot_server_mode &&
++			(whereToSendOutput != DestRemote || !lot_client_attached))
++		{
++			if (lot_client_attached)
++				lot_end_client();
++			lot_start_client();
++			send_ready_for_query = true;
++			ignore_till_sync = false;
++		}
++#endif
++
+ 		/*
+ 		 * For valgrind reporting purposes, the "current query" begins here.
+ 		 */
+@@ -4703,6 +4952,9 @@
+ 
+ 			ReadyForQuery(whereToSendOutput);
+ 			send_ready_for_query = false;
++#ifdef LOT_WASM
++			lot_sent_rfq = true;
++#endif
+ 		}
+ 
+ 		/*
+@@ -4713,7 +4965,23 @@
+ 		 */
+ 		DoingCommandRead = true;
+ 
++#ifdef LOT_WASM
++
+ 		/*
++		 * Single-process server: while this client is idle outside a
++		 * transaction, a newly connecting client takes over.
++		 */
++		if (lot_server_mode && lot_sent_rfq &&
++			!IsTransactionOrTransactionBlock() && lot_server_wait_idle())
++		{
++			DoingCommandRead = false;
++			whereToSendOutput = DestNone;
++			continue;
++		}
++		lot_sent_rfq = false;
++#endif
++
++		/*
+ 		 * (3) read a command (loop blocks here)
+ 		 */
+ 		firstchar = ReadCommand(&input_message);
+@@ -5005,6 +5273,12 @@
+ 				 */
+ 				if (whereToSendOutput == DestRemote)
+ 					whereToSendOutput = DestNone;
++
++#ifdef LOT_WASM
++				/* single-process server: the loop top takes the next client */
++				if (lot_server_mode)
++					break;
++#endif
+ 
+ 				/*
+ 				 * NOTE: if you are tempted to add more code here, DON'T!
+--- a/src/backend/utils/error/elog.c	2026-10-11 16:09:12
++++ b/src/backend/utils/error/elog.c	2026-10-11 16:09:12
+@@ -363,6 +363,22 @@
+ 		if (CritSectionCount > 0)
+ 			elevel = PANIC;
+ 
++#ifdef LOT_WASM
++
++		/*
++		 * LinuxOnTab single-process server: while a client's startup packet
++		 * is being processed, a FATAL (bad protocol version, missing user,
++		 * ...) must only drop that client, not the whole server.
++		 */
++		{
++			extern bool lot_demote_fatal;
++
++			if (elevel == FATAL && lot_demote_fatal &&
++				PG_exception_stack != NULL && !proc_exit_inprogress)
++				elevel = ERROR;
++		}
++#endif
++
+ 		/*
+ 		 * Check reasons for treating ERROR as FATAL:
+ 		 *
+--- a/src/backend/utils/fmgr/dfmgr.c	2026-10-11 16:09:12
++++ b/src/backend/utils/fmgr/dfmgr.c	2026-10-11 16:09:12
+@@ -16,6 +16,20 @@
+ 
+ #include <sys/stat.h>
+ 
++#ifdef LOT_WASM
++/*
++ * LinuxOnTab wasm guest: no dynamic loading.  The loadable modules
++ * (plpgsql, dict_snowball, the encoding conversions) are linked into the
++ * postgres binary, and lot_dlopen() & co. resolve "$libdir/<module>" and
++ * its symbols from a table generated at build time (lot_static_modules.c).
++ * The library file must still exist on disk (an empty placeholder), since
++ * the lookup below stat()s it first.
++ */
++#define dlopen lot_dlopen
++#define dlsym lot_dlsym
++#define dlerror lot_dlerror
++#define dlclose lot_dlclose
++#endif
+ #ifndef WIN32
+ #include <dlfcn.h>
+ 
+--- a/src/backend/utils/misc/guc.c	2026-10-11 16:09:12
++++ b/src/backend/utils/misc/guc.c	2026-10-11 16:09:12
+@@ -2577,7 +2577,17 @@
+ 		struct config_generic *conf = hentry->gucvar;
+ 
+ 		if (conf->flags & GUC_REPORT)
++		{
++#ifdef LOT_WASM
++			/*
++			 * LinuxOnTab single-process server: this runs once per client,
++			 * and every new client needs the full set of ParameterStatus.
++			 */
++			guc_free(conf->last_reported);
++			conf->last_reported = NULL;
++#endif
+ 			ReportGUCOption(conf);
++		}
+ 	}
+ }
+ 
+--- a/src/bin/initdb/initdb.c	2026-10-11 16:09:12
++++ b/src/bin/initdb/initdb.c	2026-10-11 16:09:12
+@@ -814,7 +814,11 @@
+ 	const char *username;
+ 
+ #ifndef WIN32
++#ifndef LOT_WASM				/* LinuxOnTab guest: everything runs as root */
+ 	if (geteuid() == 0)			/* 0 is root's uid */
++#else
++	if (0)
++#endif
+ 	{
+ 		pg_log_error("cannot be run as root");
+ 		pg_log_error_hint("Please log in (using, e.g., \"su\") as the (unprivileged) user that will own the server process.");
+@@ -1070,6 +1074,10 @@
+ static const char *
+ choose_dsm_implementation(void)
+ {
++#ifdef LOT_WASM
++	/* dsm_impl.c serves every type from process memory on this target */
++	return "posix";
++#endif
+ #if defined(HAVE_SHM_OPEN) && !defined(__sun__)
+ 	int			ntries = 10;
+ 	pg_prng_state prng_state;
+--- a/src/include/libpq/libpq.h	2026-10-11 16:09:12
++++ b/src/include/libpq/libpq.h	2026-10-11 16:09:12
+@@ -71,6 +71,9 @@
+ extern void TouchSocketFiles(void);
+ extern void RemoveSocketFiles(void);
+ extern Port *pq_init(ClientSocket *client_sock);
++#ifdef LOT_WASM
++extern void pq_lot_switch_client(ClientSocket *client_sock);
++#endif
+ extern int	pq_getbytes(char *s, size_t len);
+ extern void pq_startmsgread(void);
+ extern void pq_endmsgread(void);
+--- a/src/include/tcop/tcopprot.h	2026-10-11 16:09:12
++++ b/src/include/tcop/tcopprot.h	2026-10-11 16:09:12
+@@ -95,4 +95,15 @@
+ 									   GucContext context, GucSource source);
+ extern const char *get_stats_option_name(const char *arg);
+ 
++#ifdef LOT_WASM
++/* LinuxOnTab single-process server (tcop/postgres.c, tcop/backend_startup.c) */
++struct Port;
++extern PGDLLIMPORT bool lot_server_mode;
++extern PGDLLIMPORT bool lot_demote_fatal;
++extern void lot_server_listen(void);
++extern struct Port *lot_server_accept(void);
++extern bool lot_server_wait_idle(void);
++extern void lot_server_handoff(struct Port *port, char **argv) pg_attribute_noreturn();
++#endif
++
+ #endif							/* TCOPPROT_H */

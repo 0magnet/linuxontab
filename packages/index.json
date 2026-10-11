@@ -827,11 +827,11 @@
       "status": "available"
     },
     "xtiny": {
-      "version": "1.11.3",
+      "version": "1.12.0",
       "description": "Tiny X11 server + desktop on :5900 for real X clients (xterm, netsurf, wolf3d) with an Apps menu; open the X display panel",
-      "url": "https://linuxontab.com/packages/xtiny-1.11.3.tar.gz",
-      "size": 120062,
-      "sha256": "915414d248ca09f882b3a5b220fa379ff9b0ea4ee660dad95901c79405c87bc4",
+      "url": "https://linuxontab.com/packages/xtiny-1.12.0.tar.gz",
+      "size": 120736,
+      "sha256": "3b79a3bfaca80801df23152531aaa4b86085e6dabc8ee8c12b45854f3a4c5268",
       "bins": [
         "xtiny"
       ],
@@ -973,6 +973,46 @@
       "sha256": "2232c303aad3a210fc9cce46b28b64c3c5d56e982a0dce43b6e82f6462b7b391",
       "bins": [
         "openssh"
+      ],
+      "depends": [],
+      "status": "available"
+    },
+    "memcached": {
+      "version": "1.6.45-r0",
+      "description": "memcached in-memory key/value cache server (libevent, epoll, worker threads)",
+      "url": "https://linuxontab.com/packages/memcached-1.6.45-r0.tar.gz",
+      "size": 195133,
+      "sha256": "e259097c1837e531de603b2695f16247ae23c32eb5879c354f2535550db23041",
+      "bins": [
+        "memcached"
+      ],
+      "depends": [],
+      "status": "available"
+    },
+    "php": {
+      "version": "8.3.35-r0",
+      "description": "PHP 8.3 CLI + built-in web server (php-demo serves /var/www/php on port 8082)",
+      "url": "https://linuxontab.com/packages/php-8.3.35-r0.tar.gz",
+      "size": 3048094,
+      "sha256": "a0f388ed199914c1776f4ba7fa48737e7b6f9b8869ece096ad149c0d6babf9c2",
+      "bins": [
+        "php",
+        "php-demo"
+      ],
+      "depends": [],
+      "status": "available"
+    },
+    "postgres": {
+      "version": "17.11",
+      "description": "PostgreSQL 17 database (single-process server: one client at a time) + psql, initdb; start with postgres-demo (port 5432)",
+      "url": "https://linuxontab.com/packages/postgres-17.11.tar.gz",
+      "size": 3370477,
+      "sha256": "291993fb5aa645c5c39bdd0ea6a9708a01f2ad54b55e548fee4f2c2daa215167",
+      "bins": [
+        "postgres",
+        "initdb",
+        "psql",
+        "postgres-demo"
       ],
       "depends": [],
       "status": "available"

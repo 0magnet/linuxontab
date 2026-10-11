@@ -290,6 +290,9 @@ httpd|httpd-demo
 spiel|spiel-demo
 trust|tty:trust
 xtiny|xtiny
+memcached|memcached -u root -l 0.0.0.0 -p 11211
+php|php-demo
+postgres|postgres-demo
 EOF
 
 # ── Lean motd ────────────────────────────────────────────────────────────────

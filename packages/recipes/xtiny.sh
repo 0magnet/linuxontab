@@ -5,7 +5,12 @@
 # builds the full-image copy.
 
 NAME="xtiny"
-VERSION="1.11.3"  # 1.11.3: Install Software (apk browse) in Apps + taskbar (#13);
+VERSION="1.12.0"  # 1.12.0: Apps menu — the top Docker Hub servers as programs: nginx,
+                  # Apache httpd and PHP start their server and open the page in
+                  # NetSurf; Redis, PostgreSQL and memcached open a client in a
+                  # terminal. TryExec (desktop files too) decides "installed" when
+                  # Exec is a sh -c wrapper; up to 48 apps
+                  # 1.11.3: Install Software (apk browse) in Apps + taskbar (#13);
                   # low-latency sound: a source may send "LOTA" + u32 ms to ask
                   # for a shorter viewer cushion (~30 ms instead of 100), and
                   # lot-audio-probe measures the path end to end (#12)

@@ -3499,7 +3499,13 @@ async function doBoat() {
   let lotImage = lotParams.get('image') || '';
   if (!/^[A-Za-z0-9_.,@-]*$/.test(lotImage)) lotImage = '';
   const lotOverlayName = lotImage.startsWith('@') ? lotImage.slice(1) : '';
-  const lotSvcs = (lotImage && !lotOverlayName) ? lotImage : '';
+  // Docker Hub names map onto this repository's packages, so ?image=python
+  // or a stack's "image": "node" means what it does under Docker ('' = the
+  // lean image itself: BusyBox + apk). The heartbeat keeps the given name.
+  const DOCKER_IMAGES = { python: 'python3', node: 'nodejs', alpine: '', busybox: '', 'hello-world': '' };
+  const lotSvcs = (lotImage && !lotOverlayName)
+    ? lotImage.split(',').map(n => Object.hasOwn(DOCKER_IMAGES, n) ? DOCKER_IMAGES[n] : n).filter(Boolean).join(',')
+    : '';
   // ?run=name[,name] — start registry services WITHOUT installing (for
   // committed-image boots where the binaries are already in the overlay).
   let lotRun = lotParams.get('run') || '';
