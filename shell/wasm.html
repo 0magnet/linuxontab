@@ -868,11 +868,22 @@ class WispSlirp {
     // Offering wisp-v2 asks for the v2 INFO exchange, which is how a backend
     // says it carries UDP. See #handleWispDown for backends that refuse it.
     this.#wispOpened = false;
-    this.#ws = openWispTransport(this.#url, this.#wispOffer ? ['wisp-v2'] : undefined);
+    // A relay that declined the offer once this session (the no-offer retry
+    // opened right after an offered attempt failed) is not asked again until
+    // the tab is reloaded — one failed handshake per session, not per boot.
+    const noV2Key = 'lot.wispNoV2:' + this.#url;
+    let relayDeclinedV2 = false;
+    try { relayDeclinedV2 = sessionStorage.getItem(noV2Key) === '1'; } catch (_) {}
+    const offering = this.#wispOffer && !relayDeclinedV2;
+    this.#ws = openWispTransport(this.#url, offering ? ['wisp-v2'] : undefined);
     this.#ws.binaryType = 'arraybuffer';
     this.#ws.onopen = () => {
       console.log('[WISP] WebSocket open');
       this.#wispOpened = true;
+      try {
+        if (this.#ws.protocol === 'wisp-v2') sessionStorage.removeItem(noV2Key);
+        else if (!offering && !this.#wispOffer) sessionStorage.setItem(noV2Key, '1');
+      } catch (_) {}
       this.#wsDown = false;
       this.#wispVersion = 0;
       this.#wispUdp = false;
