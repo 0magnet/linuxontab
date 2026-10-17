@@ -667,6 +667,12 @@ class WispSlirp {
   #lastWispTx = 0;        // Date.now() of the last byte sent over the WISP WS
   #watchdogTimer = null;  // periodic half-open-socket detector
   #wsDown = false;        // guards against double reconnect
+  #wispVersion = 0;       // 0 until the session opens, then 1 or 2
+  #wispUdp = false;       // the server's v2 INFO offered UDP streams
+  #wispHelloTimer = null; // falls back to v1 if a v2 server never sends INFO
+  #wispOffer = true;      // offer wisp-v2 on the next connect
+  #wispOpened = false;    // the current socket reached open
+  #udpFlows = new Map();  // 'srcPort>dstIp:dstPort' → { id, quote, timer }
   #streamId = 1;
   #streams = new Map();   // id → { onData, onClose }
   #tcpConns = new Map();  // guestSrcPort → TcpConn
@@ -818,6 +824,10 @@ class WispSlirp {
     if (this.#wsDown) return;
     this.#wsDown = true;
     this.#wsReady = false;
+    clearTimeout(this.#wispHelloTimer);
+    this.#wispHelloTimer = null;
+    for (const f of this.#udpFlows.values()) clearTimeout(f.timer);
+    this.#udpFlows.clear();
     console.log('[WISP] down —', reason);
     if (this.#ws) {
       this.#ws.onclose = this.#ws.onerror = this.#ws.onmessage = null;
@@ -832,12 +842,21 @@ class WispSlirp {
     // out its read deadline before retrying.
     for (const [port, c] of this.#tcpConns)
       if (c.wispId !== null && c.wispId !== undefined) this.#tcpConns.delete(port);
+    // Chromium fails the handshake when a server ignores an offered
+    // subprotocol, which is how a v1-only relay answers. So a socket that
+    // offered wisp-v2 and never opened is retried at once without it. If that
+    // fails too, the problem was the network and the offer comes back.
+    let delay = 1000;
+    if (!this.#wispOpened) {
+      if (this.#wispOffer) { this.#wispOffer = false; delay = 0; }
+      else this.#wispOffer = true;
+    }
     if (!this.#reconnectTimer) {
       this.#reconnectTimer = setTimeout(() => {
         this.#reconnectTimer = null;
         this.#wsDown = false;
         this.#connectWisp();
-      }, 1000);
+      }, delay);
     }
   }
 
@@ -846,16 +865,23 @@ class WispSlirp {
     // openWispTransport keeps ws:// and wss:// on a real WebSocket and lets a
     // backend that cannot be reached by URL — an in-page one on vnet:<port> —
     // be used instead. See shell/wisp-transport.js.
-    this.#ws = openWispTransport(this.#url);
+    // Offering wisp-v2 asks for the v2 INFO exchange, which is how a backend
+    // says it carries UDP. See #handleWispDown for backends that refuse it.
+    this.#wispOpened = false;
+    this.#ws = openWispTransport(this.#url, this.#wispOffer ? ['wisp-v2'] : undefined);
     this.#ws.binaryType = 'arraybuffer';
     this.#ws.onopen = () => {
       console.log('[WISP] WebSocket open');
-      this.#wsReady = true;
+      this.#wispOpened = true;
       this.#wsDown = false;
+      this.#wispVersion = 0;
+      this.#wispUdp = false;
       this.#lastWispRx = Date.now();   // fresh — don't let the watchdog trip immediately
       this.#lastWispTx = Date.now();
-      for (const pkt of this.#wsQueue) this.#ws.send(pkt);
-      this.#wsQueue = [];
+      // A WebSocket that declined the offer is v1 and starts at once, as it
+      // always has. Otherwise the server's opening frame says which version.
+      if (this.#ws.protocol === '') this.#wispStart(1);
+      else this.#wispHelloTimer = setTimeout(() => this.#wispStart(this.#wispVersion || 1), 3000);
     };
     this.#ws.onmessage = ev => this.#onWispMsg(new Uint8Array(ev.data));
     this.#ws.onclose = this.#ws.onerror = (ev) =>
@@ -867,17 +893,55 @@ class WispSlirp {
     else this.#wsQueue.push(buf);
   }
 
-  #wispConnect(host, port) {
+  // Open the session: send what queued while the version was being settled.
+  #wispStart(version) {
+    clearTimeout(this.#wispHelloTimer);
+    this.#wispHelloTimer = null;
+    if (this.#wsReady) return;
+    this.#wispVersion = version;
+    this.#wsReady = true;
+    console.log('[WISP] session open: v' + version + (this.#wispUdp ? ' with UDP' : ''));
+    for (const pkt of this.#wsQueue) this.#ws.send(pkt);
+    this.#wsQueue = [];
+  }
+
+  // The server's v2 INFO: version, then extensions as id, u32 LE length,
+  // metadata. Answer with v2.0 and UDP (0x01) if it was offered, then open
+  // on the CONTINUE that follows. Any other major version is left unanswered,
+  // which makes a v2 server fall back to v1.
+  #wispInfo(p) {
+    if (p.length < 2) return this.#wispStart(1);
+    let udp = false;
+    for (let o = 2; o + 5 <= p.length; ) {
+      if (p[o] === 0x01) udp = true;
+      o += 5 + new DataView(p.buffer, p.byteOffset + o + 1, 4).getUint32(0, true);
+    }
+    if (p[0] !== 2) {
+      console.log('[WISP] server speaks v' + p[0] + '.' + p[1] + ', staying on v1');
+      return this.#wispStart(1);
+    }
+    this.#wispUdp = udp;
+    this.#wispVersion = 2;
+    const info = new Uint8Array(udp ? 12 : 7);
+    info[0] = 0x05;                 // INFO on stream 0
+    info[5] = 2; info[6] = 0;       // version 2.0
+    if (udp) info[7] = 0x01;        // UDP, no metadata
+    this.#lastWispTx = Date.now();
+    this.#ws.send(info);
+  }
+
+  #wispConnect(host, port, type = 0x01) {
     const id = this.#streamId++;
     const resolvedHost = this.#dnsCache.get(host) || host;
-    if (resolvedHost !== host) console.log('[WISP] CONNECT', resolvedHost, port, '(resolved from', host+')');
-    else console.log('[WISP] CONNECT', resolvedHost, port);
+    const proto = type === 0x02 ? 'udp' : 'tcp';
+    if (resolvedHost !== host) console.log('[WISP] CONNECT', proto, resolvedHost, port, '(resolved from', host+')');
+    else console.log('[WISP] CONNECT', proto, resolvedHost, port);
     const hostBytes = new TextEncoder().encode(resolvedHost);
     const pkt = new Uint8Array(1 + 4 + 1 + 2 + hostBytes.length);
     const dv = new DataView(pkt.buffer);
     pkt[0] = 0x01;                  // CONNECT
     dv.setUint32(1, id, true);      // stream ID (LE)
-    pkt[5] = 0x01;                  // TCP
+    pkt[5] = type;                  // 0x01 TCP, 0x02 UDP (v2 only)
     dv.setUint16(6, port, true);    // port (LE) — WISP v1 uses little-endian
     pkt.set(hostBytes, 8);
     this.#streams.set(id, { onData: null, onClose: null });
@@ -908,6 +972,12 @@ class WispSlirp {
     const type = buf[0];
     const id = new DataView(buf.buffer, buf.byteOffset).getUint32(1, true);
     const payload = buf.slice(5);
+    if (!this.#wsReady) {
+      // Still settling the version: v2 opens with INFO and then CONTINUE,
+      // v1 with CONTINUE alone.
+      if (type === 0x05 && this.#wispVersion === 0) return this.#wispInfo(payload);
+      if (type === 0x03 && id === 0) return this.#wispStart(this.#wispVersion || 1);
+    }
     if (type === 0x02) {
       const s = this.#streams.get(id);
       if (s?.onData) { if (window.__netdebug) console.log('[WISP] DATA sid='+id+' len='+payload.length); s.onData(payload); }
@@ -917,7 +987,7 @@ class WispSlirp {
       const reasons = {1:'voluntary',2:'unexpected',3:'blocked',4:'throttled',0x41:'server_err',0x42:'unreach'};
       console.log('[WISP] CLOSE sid='+id+' reason='+reason+'('+(reasons[reason]||'?')+')');
       const s = this.#streams.get(id);
-      if (s?.onClose) s.onClose();
+      if (s?.onClose) s.onClose(reason);
       this.#streams.delete(id);
     }
     // 0x03 CONTINUE (flow control): ignored — we rely on WS backpressure
@@ -1800,7 +1870,71 @@ class WispSlirp {
     const srcPort = dv.getUint16(0, false);
     const dstPort = dv.getUint16(2, false);
     const payload = udp.slice(8);
-    if (dstPort === 53) this.#forwardDns(srcIp, srcPort, payload).catch(() => {});
+    const toGw = WispSlirp.#ipEq(dstIp, WispSlirp.GW_IP);
+    // DNS keeps its own path when the backend has no UDP, and for the
+    // gateway's resolver when that is DoH (the cloud relay's default).
+    if (dstPort === 53 && (!this.#wispUdp || (toGw && !this.#dnsResolver))) {
+      this.#forwardDns(srcIp, srcPort, payload).catch(() => {});
+      return;
+    }
+    if (!this.#wispUdp) return this.#udpUnreachable(srcIp, dstIp, udp, 'backend has no UDP');
+    if (toGw && dstPort !== 53) return this.#udpUnreachable(srcIp, dstIp, udp, 'nothing on the gateway');
+    this.#udpForward(srcIp, srcPort, dstIp, dstPort, toGw ? this.#dnsResolver : dstIp.join('.'), udp);
+  }
+
+  // One v2 UDP stream per guest flow, one Wisp DATA frame per datagram in
+  // each direction. A flow idle for 60 s is closed.
+  #udpForward(srcIp, srcPort, dstIp, dstPort, host, udp) {
+    const key = srcPort + '>' + dstIp.join('.') + ':' + dstPort;
+    let f = this.#udpFlows.get(key);
+    if (!f) {
+      const id = this.#wispConnect(host, dstPort, 0x02);
+      f = { id, quote: null, timer: null };
+      this.#udpFlows.set(key, f);
+      const s = this.#streams.get(id);
+      s.onData = (data) => {
+        if (dstPort === 53) this.#snoopDnsResponse(data);
+        const reply = new Uint8Array(8 + data.length);
+        const dv = new DataView(reply.buffer);
+        dv.setUint16(0, dstPort, false);
+        dv.setUint16(2, srcPort, false);
+        dv.setUint16(4, reply.length, false);
+        reply.set(data, 8);
+        this.#sendIpv4(new Uint8Array(dstIp), new Uint8Array(srcIp), 17, reply);
+      };
+      // 0x01 unspecified and 0x02 voluntary are ordinary ends; anything else
+      // (blocked, unreachable, refused) is reported to the guest.
+      s.onClose = (reason) => {
+        clearTimeout(f.timer);
+        if (this.#udpFlows.get(key) === f) this.#udpFlows.delete(key);
+        if (reason !== 0x01 && reason !== 0x02 && f.quote)
+          this.#udpUnreachable(srcIp, dstIp, f.quote, 'backend closed it, reason 0x' + reason.toString(16));
+      };
+    }
+    f.quote = udp.slice(0, 8);
+    clearTimeout(f.timer);
+    f.timer = setTimeout(() => {
+      if (this.#udpFlows.get(key) === f) this.#udpFlows.delete(key);
+      this.#wispClose(f.id);
+    }, 60000);
+    this.#wispData(f.id, udp.slice(8));
+  }
+
+  // ICMP port unreachable (type 3, code 3) to the guest, quoting the IP header
+  // and first 8 bytes of the datagram as RFC 792 asks.
+  #udpUnreachable(srcIp, dstIp, udp, why) {
+    console.log('[UDP] ' + dstIp.join('.') + ':' + ((udp[2] << 8) | udp[3]) + ' unreachable: ' + why);
+    const icmp = new Uint8Array(8 + 20 + 8);
+    const dv = new DataView(icmp.buffer);
+    icmp[0] = 3; icmp[1] = 3;
+    icmp[8] = 0x45;
+    dv.setUint16(10, 20 + ((udp[4] << 8) | udp[5]), false);
+    icmp[16] = 64; icmp[17] = 17;
+    icmp.set(srcIp, 20); icmp.set(dstIp, 24);
+    dv.setUint16(18, WispSlirp.#cksum(icmp.slice(8, 28)), false);
+    icmp.set(udp.slice(0, 8), 28);
+    dv.setUint16(2, WispSlirp.#cksum(icmp), false);
+    this.#sendIpv4(new Uint8Array(dstIp), new Uint8Array(srcIp), 1, icmp);
   }
 
   // Parse a DNS name from a buffer at offset; returns { name, offset }.

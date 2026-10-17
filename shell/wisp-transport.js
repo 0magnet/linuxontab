@@ -1,9 +1,9 @@
 // shell/wisp-transport.js
 //
-// openWispTransport(url) — the socket WispSlirp runs on.
+// openWispTransport(url, protocols) — the socket WispSlirp runs on.
 //
-// WispSlirp only ever uses seven members of its socket: binaryType, onopen,
-// onmessage, onclose, onerror, send() and close(). That is already a
+// WispSlirp only ever uses eight members of its socket: binaryType, protocol,
+// onopen, onmessage, onclose, onerror, send() and close(). That is already a
 // duck-typed WebSocket; this makes the choice explicit so a backend that is
 // not reachable by URL can be used. For ws:// and wss:// it returns a real
 // WebSocket and nothing changes.
@@ -58,9 +58,12 @@
 	// VnetSocket presents a virtual-loopback conn with the surface WispSlirp
 	// uses. Event handlers are fired asynchronously, as a real WebSocket's
 	// are, so a caller that assigns them after construction still sees open.
-	function VnetSocket(port) {
+	function VnetSocket(port, protocols) {
 		var self = this;
 		this.binaryType = 'arraybuffer';
+		// There is no header to carry a subprotocol offer here, and an in-page
+		// backend on a raw conn speaks v2, so report the offer as accepted.
+		this.protocol = (protocols && protocols[0]) || '';
 		this.readyState = 0; // CONNECTING
 		this.onopen = null;
 		this.onmessage = null;
@@ -156,11 +159,11 @@
 	}
 
 	// openWispTransport returns the socket for a Wisp endpoint. Anything that
-	// is not vnet: is a URL a real WebSocket can open, which keeps the default
-	// path byte-identical to what it was.
-	globalThis.openWispTransport = function (url) {
+	// is not vnet: is a URL a real WebSocket can open, with the subprotocols
+	// WispSlirp offers.
+	globalThis.openWispTransport = function (url, protocols) {
 		var m = /^vnet:(?:\/\/)?(\d+)\/?$/.exec(String(url));
-		if (!m) return new WebSocket(url);
-		return new VnetSocket(parseInt(m[1], 10));
+		if (!m) return new WebSocket(url, protocols);
+		return new VnetSocket(parseInt(m[1], 10), protocols);
 	};
 })();
