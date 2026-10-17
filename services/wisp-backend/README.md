@@ -16,6 +16,42 @@ It runs the **same `traits` binary** as the upstream traits.build server (`apptr
 
 ## Deploy
 
+**Do not build from traits.build `main`.** Its `traits` binary changed config
+format after May 2026 (`Missing [implementation] section (required unless
+command= is set)`) and crash-loops under this app's config — that took the
+relay down for four minutes on 2026-10-17. The production image is built from
+the traits.build branch **`wisp-v2-on-may14`** = commit 22d15788 (the May-14
+deploy) + the Wisp v2 negotiation patch. Rebuild from that branch (or a
+descendant of it) and smoke-test the image on a throwaway app before
+pointing production at it:
+
+```sh
+# in a checkout of traits.build at branch wisp-v2-on-may14
+fly deploy -c ~/.ai/LinuxOnTab-kernel/services/wisp-backend/fly.toml \
+  --build-only --push --remote-only --image-label <label>
+# canary: same fly.toml with app renamed and the [[mounts]] section removed
+fly apps create linuxontab-net-canary && fly deploy -c fly-canary.toml \
+  --image registry.fly.io/linuxontab-net:<label> --ha=false
+# verify: /health 200, /wisp/debug, a handshake offering Sec-WebSocket-Protocol:
+# wisp-v2 gets it echoed, and wasm.html?wisp=wss://linuxontab-net-canary.fly.dev/wisp
+# logs "[WISP] session open: v2". Then:
+fly deploy -c fly.toml --image registry.fly.io/linuxontab-net:<label> --ha=false
+fly apps destroy linuxontab-net-canary -y
+```
+
+Rollback: `fly deploy -c fly.toml --image registry.fly.io/linuxontab-net:<previous deployment tag> --ha=false`
+(`fly releases -a linuxontab-net` lists them).
+
+## Protocol
+
+Wisp v1, plus v2 negotiation: a client offering the `wisp-v2` subprotocol
+gets it echoed and an INFO frame (version 2.0, no extensions) before the
+initial CONTINUE, so WispSlirp (which offers v2 since linuxontab PR #15)
+connects without the failed handshake a v1-only server causes. UDP streams
+are still refused (0x41); the guest gets ICMP port-unreachable for them.
+
+## Deploy (historical notes)
+
 ```sh
 # One-time
 fly apps create linuxontab-net
