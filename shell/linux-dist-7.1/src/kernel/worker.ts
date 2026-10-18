@@ -7,6 +7,8 @@ import { export_stack_pointer, read_wasm_memories } from "./wasm_binary.ts";
 // LinuxOnTab: WALI (Rust) host imports — see src/lot/wali-bridge.js.
 // @ts-ignore plain JS module
 import { makeWaliImports } from "../lot/wali-bridge.js";
+// LinuxOnTab: WASI preview1 (GOOS=wasip1 Go) host imports — see src/lot/wasi-bridge.js.
+import { makeWasiImports, isWasiModule } from "../lot/wasi-bridge.js";
 import {
   allocate_shared_memory,
   HALT_KERNEL,
@@ -427,9 +429,23 @@ const NR_WASM_GET_ARGS = 245;
       wali_env = w.envExtra ?? {};
       wali_imports = w.wali;
     }
+    // WASI preview1 modules (GOOS=wasip1 Go) get wasi_snapshot_preview1.*
+    // served with this process's own syscalls.
+    const wasi_imports = isWasiModule(context.module)
+      ? makeWasiImports({
+          memory: context.memory,
+          kernel: { exports: {
+            get_args_length: () => kernel_instance.exports.get_args_length(),
+            get_args: (buf: number) => kernel_instance.exports.syscall(NR_WASM_GET_ARGS, buf >>> 0, 262144, 0, 0, 0, 0),
+          } },
+          syscall: (...a: number[]) => linux_syscall(a[0]!, a[1]!, a[2]!, a[3]!, a[4]!, a[5]!, a[6]!),
+          log: (m: string) => console.debug("[wasi] " + m),
+        })
+      : {};
     return new WebAssembly.Instance(context.module, {
       env: { memory: context.memory, ...wali_env },
       ...(wali_imports ? { wali: wali_imports } : {}),
+      ...wasi_imports,
       linux: {
         syscall: linux_syscall,
         get_thread_area: kernel_instance.exports.get_thread_area,

@@ -49,7 +49,9 @@ export function user_module_imports_supported(module: WebAssembly.Module): boole
     supported_user_module_imports.has(`${module}\0${name}\0${kind}`) ||
     // LinuxOnTab: WALI (Rust) modules import wali.SYS_* plus env.* hooks that
     // the wali bridge supplies at instantiation (a missing one fails loudly).
-    (kind === "function" && (module === "wali" || module === "env")),
+    (kind === "function" && (module === "wali" || module === "env")) ||
+    // LinuxOnTab: WASI preview1 modules (GOOS=wasip1 Go); src/lot/wasi-bridge.js.
+    (kind === "function" && module === "wasi_snapshot_preview1"),
   );
 }
 
