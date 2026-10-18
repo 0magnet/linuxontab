@@ -293,6 +293,7 @@ xtiny|xtiny
 memcached|memcached -u root -l 0.0.0.0 -p 11211
 php|php-demo
 postgres|postgres-demo
+syncthing|syncthing serve --no-browser --gui-address=0.0.0.0:8384 --home=/root/.local/state/syncthing
 EOF
 
 # ── Lean motd ────────────────────────────────────────────────────────────────
@@ -310,6 +311,7 @@ cat > "$STAGE/etc/motd" << 'EOF'
   Web servers:  nginx-demo (:8080) · httpd-demo (:8081)  → top bar: web view
   Media:        ffmpeg / ffprobe 7.0 (installs on first use, ~15 MB)
   Spiel:        spiel-demo — the Spiel media server + web UI on :8080 (web view)
+  File sync:    syncthing — peer-to-peer sync, web GUI on :8384 (console row "syncthing")
   X display:    vnc-server · vnc-snake · xtiny (X11 desktop)  → top bar: X display
   Games:        wolf3d — Wolfenstein 3D on the X desktop (run `xtiny &` first)
   Browser:      netsurf — web browser on the X desktop (run `xtiny &` first)

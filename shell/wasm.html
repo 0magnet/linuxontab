@@ -6428,6 +6428,19 @@ function xDisconnect() {
 // concurrent injected connections wedge single-threaded guest servers.
 const guestWeb = (() => {
   const jars = new Map();                    // port → Map(cookieName → value)
+  // Script-readable cookies (no HttpOnly), mirrored into document.cookie under
+  // each guest path that requests them: apps read their CSRF token from there.
+  const readable = new Map();                // port → Set(cookieName)
+  const mirrored = new Map();                // path + '\0' + name → value
+  function mirrorCookies(port, prefix) {
+    const jar = jars.get(port), names = readable.get(port);
+    if (!jar || !names || !prefix) return;
+    for (const name of names) {
+      const value = jar.get(name), key = prefix + '\0' + name;
+      if (value === undefined || mirrored.get(key) === value) continue;
+      try { document.cookie = name + '=' + value + '; path=' + prefix + '/; SameSite=Strict'; mirrored.set(key, value); } catch (_) {}
+    }
+  }
   let queue = Promise.resolve();
   const SLICE = 128 * 1024;                  // Range slice for big GET bodies
   // Load progress for the web view's loading overlay (wvLoading below).
@@ -6617,11 +6630,8 @@ const guestWeb = (() => {
         if (eq <= 0) continue;
         const name = sc.slice(0, eq).trim(), value = sc.slice(eq + 1, sem > 0 ? sem : undefined).trim();
         jar.set(name, value);
-        // Mirror script-readable cookies into the framed app's document.cookie:
-        // apps read their CSRF token from there (Syncthing, Django, Jupyter).
-        if (!/;\s*httponly/i.test(sc)) {
-          try { document.cookie = name + '=' + value + '; path=' + (prefix || '/guest/' + port) + '/; SameSite=Strict'; } catch (_) {}
-        }
+        const names = readable.get(port) || readable.set(port, new Set()).get(port);
+        if (/;\s*httponly/i.test(sc)) names.delete(name); else names.add(name);
       }
       const loc = r.headers['location'];
       // Navigations pass redirects through (rewritten below); subresource
@@ -6638,6 +6648,7 @@ const guestWeb = (() => {
     if (r.headers['location'] && mode === 'navigate') {
       out.push(['location', (prefix || '/guest/' + port) + toGuestPath(r.headers['location'], curPath)]);
     }
+    mirrorCookies(port, prefix);   // also cookies set by an earlier request (the ?web probe has no prefix)
     return { status: r.status, headers: out, finalPath: curPath, body: r.body.length ? r.body.slice().buffer : null };
   }
 
