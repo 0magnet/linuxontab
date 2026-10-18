@@ -44,11 +44,21 @@ Rollback: `fly deploy -c fly.toml --image registry.fly.io/linuxontab-net:<previo
 
 ## Protocol
 
-Wisp v1, plus v2 negotiation: a client offering the `wisp-v2` subprotocol
-gets it echoed and an INFO frame (version 2.0, no extensions) before the
-initial CONTINUE, so WispSlirp (which offers v2 since linuxontab PR #15)
-connects without the failed handshake a v1-only server causes. UDP streams
-are still refused (0x41); the guest gets ICMP port-unreachable for them.
+Wisp v1, plus v2 with the UDP extension. A client offering the `wisp-v2`
+subprotocol gets it echoed and an INFO frame (version 2.0, extension 0x01 UDP)
+before the initial CONTINUE, so WispSlirp (offers v2 since linuxontab PR #15)
+connects with no failed handshake and carries guest UDP — DNS to any
+resolver, NTP, QUIC — as Wisp UDP streams.
+
+UDP streams: one connected `UdpSocket` each, one DATA frame per datagram,
+closed after 60 s idle, at most 64 per WebSocket. Refusals carry a CLOSE
+reason that WispSlirp turns into ICMP port-unreachable for the guest:
+0x42 unresolvable host or ICMP-refused target, 0x48 loopback / link-local
+(incl. 169.254.169.254 metadata) / unique-local v6 (Fly's 6PN), 0x49 over
+the per-connection cap. `/wisp/debug` reports the limits.
+
+Current image: `registry.fly.io/linuxontab-net:wisp-udp` (branch
+`wisp-v2-on-may14` @ 3481ebec). Previous: `wisp-v2-may14` (TCP-only v2).
 
 ## Deploy (historical notes)
 
