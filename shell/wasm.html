@@ -6577,6 +6577,11 @@ const guestWeb = (() => {
     for (const k of ['content-type', 'accept', 'accept-language', 'if-none-match', 'if-modified-since', 'x-requested-with', 'range']) {
       if (headers && headers[k]) fwd.push(k + ': ' + headers[k]);
     }
+    // Apps' own request headers: header-based CSRF and API auth (Syncthing's
+    // X-CSRF-Token-*, X-API-Key, Authorization) refuse requests without them.
+    for (const [k, v] of Object.entries(headers || {})) {
+      if ((k.startsWith('x-') && k !== 'x-requested-with') || k === 'authorization') fwd.push(k + ': ' + v);
+    }
     const callerRange = !!(headers && headers['range']);
     if (jar.size) fwd.push('Cookie: ' + [...jar.entries()].map(([k, v]) => k + '=' + v).join('; '));
 
@@ -6609,7 +6614,14 @@ const guestWeb = (() => {
       }
       for (const sc of r.setCookies) {
         const eq = sc.indexOf('='), sem = sc.indexOf(';');
-        if (eq > 0) jar.set(sc.slice(0, eq).trim(), sc.slice(eq + 1, sem > 0 ? sem : undefined).trim());
+        if (eq <= 0) continue;
+        const name = sc.slice(0, eq).trim(), value = sc.slice(eq + 1, sem > 0 ? sem : undefined).trim();
+        jar.set(name, value);
+        // Mirror script-readable cookies into the framed app's document.cookie:
+        // apps read their CSRF token from there (Syncthing, Django, Jupyter).
+        if (!/;\s*httponly/i.test(sc)) {
+          try { document.cookie = name + '=' + value + '; path=' + (prefix || '/guest/' + port) + '/; SameSite=Strict'; } catch (_) {}
+        }
       }
       const loc = r.headers['location'];
       // Navigations pass redirects through (rewritten below); subresource
