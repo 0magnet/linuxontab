@@ -57,8 +57,31 @@ reason that WispSlirp turns into ICMP port-unreachable for the guest:
 (incl. 169.254.169.254 metadata) / unique-local v6 (Fly's 6PN), 0x49 over
 the per-connection cap. `/wisp/debug` reports the limits.
 
-Current image: `registry.fly.io/linuxontab-net:wisp-udp` (branch
-`wisp-v2-on-may14` @ 3481ebec). Previous: `wisp-v2-may14` (TCP-only v2).
+### Per-client limits
+
+A client is its IPv4 address or IPv6 /64, read from `Fly-Client-IP` (Fly's
+edge overwrites a client-supplied value — verified; off Fly the peer address
+is used, because the header would be spoofable there).
+
+| Limit | Default | Env override | When exceeded |
+|---|---|---|---|
+| concurrent WebSockets | 64 | `WISP_MAX_CONNS_PER_IP` | HTTP 429 on upgrade |
+| stream opens (TCP + UDP) | 20/s, burst 200 | `WISP_OPENS_PER_SEC`, `WISP_OPENS_BURST` | CLOSE 0x49 |
+| concurrent UDP streams | 256 | `WISP_MAX_UDP_STREAMS_PER_IP` | CLOSE 0x49 |
+| outbound UDP packets | 500/s, burst 1000 | `WISP_UDP_PPS`, `WISP_UDP_PPS_BURST` | datagram dropped |
+| outbound UDP bytes | 1 MiB/s, burst 2 MiB | `WISP_UDP_BYTES_PER_SEC`, `WISP_UDP_BYTES_BURST` | datagram dropped |
+
+Defaults are generous on purpose: a tabs-as-containers stack is one socket
+per tab, and offices / mobile carriers share one IPv4. To tune, add the env
+vars to `[env]` in `fly.toml` and redeploy the same image
+(`fly deploy -c fly.toml --image registry.fly.io/linuxontab-net:<tag>`) — no
+rebuild. `/wisp/debug` shows the active limits, the caller's client key and
+how many clients are tracked; refusals log as `conn_limit`, `throttled (…)`
+and `udp_rate_dropped … datagrams=N`.
+
+Current image: `registry.fly.io/linuxontab-net:wisp-ratelimit` (branch
+`wisp-v2-on-may14` @ ccd5fcd5). Rollback chain: `wisp-udp` (UDP, no
+per-client limits) → `wisp-v2-may14` (TCP-only v2).
 
 ## Deploy (historical notes)
 
