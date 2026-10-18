@@ -548,16 +548,16 @@
       "depends": []
     },
     "syncthing": {
-      "version": "1.27.12",
-      "description": "Syncthing file synchronization daemon (wasip1, run via wasm3)",
-      "url": "https://linuxontab.com/packages/syncthing-1.27.12.tar.gz",
-      "size": 9470902,
-      "sha256": "714ba54eebfba7d67a121d48ae3090ce90f5f054b1b54192b2062852e97365fd",
+      "version": "1.30.0-r0",
+      "description": "Syncthing: continuous peer-to-peer file synchronization (web GUI on :8384)",
+      "url": "https://linuxontab.com/packages/syncthing-1.30.0-r0.tar.gz",
+      "size": 11092586,
+      "sha256": "75446952c3f3cc26000cc99d8d7c18b8e223998de7c359233191a7ccdc5632bc",
       "bins": [
-        "syncthing.wasm"
+        "syncthing"
       ],
-      "status": "available",
-      "depends": []
+      "depends": [],
+      "status": "available"
     },
     "mc": {
       "version": "4.8.33-r1",
