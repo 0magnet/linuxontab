@@ -5236,6 +5236,27 @@ $('tn-run-btn').onclick = () => {
       }, 300);
     });
   }
+  // Run a script whose text must not appear in the terminal. Typed input is
+  // echoed into the xterm, its scrollback and the beacon's terminal tail, so
+  // secrets go through the package drop disk (/dev/vdb) instead: the page
+  // writes the script into the last 64 KiB of the drop buffer (apk uses the
+  // start) and types only a loader carrying block offsets. drop_caches first:
+  // a previous run's blocks may still be cached in the guest. The region is
+  // wiped once the guest has read it.
+  const SECRET_AREA = 64 * 1024;
+  async function guestRunSecret(script, timeoutMs = 30000) {
+    const drop = window.__pkgDropBytes;
+    const bytes = new TextEncoder().encode(script);
+    if (!drop || bytes.length > SECRET_AREA) return false;
+    const off = drop.byteLength - SECRET_AREA;   // 4 KiB aligned: the buffer is 100 MiB + 8 KiB
+    drop.fill(0, off);
+    drop.set(bytes, off);
+    try {
+      return await guestRun(`echo 3 > /proc/sys/vm/drop_caches; dd if=/dev/vdb bs=4096 skip=${off / 4096} count=${Math.ceil(bytes.length / 4096)} 2>/dev/null | head -c ${bytes.length} > /tmp/.lot-secret.sh && sh /tmp/.lot-secret.sh; R=$?; rm -f /tmp/.lot-secret.sh; [ "$R" = 0 ]`, timeoutMs);
+    } finally {
+      drop.fill(0, off);
+    }
+  }
   function waitPublic(timeoutMs = 30000) {
     return new Promise((resolve) => {
       const have = window.getTunnelInfo && window.getTunnelInfo().publicEndpoints[22];
@@ -5280,17 +5301,16 @@ $('tn-run-btn').onclick = () => {
       // A host key of this tab's own: the images all ship the same one.
       let hk = null;
       try { hk = await genHostKey('linuxontab-tab'); } catch (_) { /* no WebCrypto Ed25519: keep the image's key */ }
-      status('setting a random root password' + (hk ? ' and a new host key' : '') + ' in the guest (typed into the terminal)…');
-      if (hk) {
-        guestSend(` cat > /tmp/.lot-hostkey <<'EOF'\n${hk.priv}EOF`);
-        await new Promise((r) => setTimeout(r, 1500));
-      }
+      status('setting a random root password' + (hk ? ' and a new host key' : '') + ' in the guest…');
+      // Files the script below writes first. Public keys travel base64 so no
+      // key text is ever parsed by the shell.
+      let files = '';
+      // The key file is made private before the key goes in (no umask: the
+      // sshd loop this script may start would pass it on to sessions).
+      if (hk) files += `rm -f /tmp/.lot-hostkey && : > /tmp/.lot-hostkey && chmod 600 /tmp/.lot-hostkey\ncat > /tmp/.lot-hostkey <<'EOF'\n${hk.priv}EOF\n`;
       if (ak.keys.length) {
-        // base64 in short lines: long RSA keys survive the terminal and no
-        // key text is ever parsed by the shell.
         const b = btoa(ak.keys.join('\n') + '\n').match(/.{1,64}/g).join('\n');
-        guestSend(` cat > /tmp/.lot-ak.b64 <<'EOF'\n${b}\nEOF`);
-        await new Promise((r) => setTimeout(r, 1500));
+        files += `cat > /tmp/.lot-ak.b64 <<'EOF'\n${b}\nEOF\n`;
       }
       // sshd's listener hands its startup keys to every session, so it has to
       // restart for the new key; SIGHUP would be cleaner but this build's
@@ -5312,7 +5332,7 @@ $('tn-run-btn').onclick = () => {
       // drop duplicates.
       const akf = '/root/.ssh/authorized_keys';
       const akCmd = ak.keys.length ? ` && mkdir -p /root/.ssh && chown root:root /root /root/.ssh && chmod 700 /root/.ssh && touch ${akf} && base64 -d /tmp/.lot-ak.b64 >> ${akf} && awk '!s[$0]++' ${akf} > /tmp/.lot-ak && mv /tmp/.lot-ak ${akf} && chown root:root ${akf} && chmod 600 ${akf} && rm -f /tmp/.lot-ak.b64` : '';
-      const ok = await guestRun(`sed -i "s#^root:[^:]*:#root:$(cryptpw -m des '${pw}' '${salt}'):#" /etc/shadow${akCmd}${keyCmd}`);
+      const ok = await guestRunSecret(`${files}sed -i "s#^root:[^:]*:#root:$(cryptpw -m des '${pw}' '${salt}'):#" /etc/shadow${akCmd}${keyCmd}\n`);
       if (!ok) { status('Could not set the password: is the guest shell at a prompt? Try again from an idle shell.', 'err'); return; }
       if (hk || startSshd) {
         // Use up rc's one-connection fallback, then wait for the daemon.
