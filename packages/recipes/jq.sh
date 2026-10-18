@@ -3,7 +3,8 @@
 # Uses bundled oniguruma (regex library) — no external dependencies.
 
 NAME="jq"
-VERSION="1.7.1-r1"   # r1: relinked on the libc.a whose pthread_create zeroes TLS/TSD
+VERSION="1.7.1-r2"   # r2: sbrk-only dlmalloc (arrays >~50k elements segfaulted in mallocng)
+                     # r1: relinked on the libc.a whose pthread_create zeroes TLS/TSD
 DESCRIPTION="Lightweight command-line JSON processor"
 SOURCE_URL="https://github.com/jqlang/jq/releases/download/jq-1.7.1/jq-1.7.1.tar.gz"
 SOURCE_SHA256="478c9ca129fd2e3443fe27314b455e211e0d8c60bc8ff7df703873deeee580c2"
@@ -31,11 +32,16 @@ build() {
 
     make -j4
 
+    # dlmalloc: jq arrays grow by realloc, and past ~50k elements the block
+    # crosses mallocng's 128 KB large-block path, which needs mmap and traps
+    # here (exit 139). jq creates no threads, so the unlocked variant is enough.
+    $CC $CFLAGS -w -c "$REPO_ROOT/sysroot/wasm_dlmalloc.c" -o wasm_dlmalloc.o
+
     # Re-link the final binary: strip --no-entry, add CRT1/BUILTINS for _start.
     # libjq.a is already clean (no nested archives) — just re-link directly.
     LDFLAGS_FINAL=$(printf '%s\n' "$LDFLAGS" | sed 's/-Wl,--no-entry//g')
     $CC $CFLAGS $LDFLAGS_FINAL \
-        -o jq src/main.o .libs/libjq.a \
+        -o jq src/main.o .libs/libjq.a wasm_dlmalloc.o \
         $CRT1 -lc -lm $BUILTINS
 
     install -Dm755 jq "$STAGE/bin/jq"

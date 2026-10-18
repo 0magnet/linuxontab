@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "generated": "2026-10-08",
+  "generated": "2026-10-17",
   "packages": {
     "busybox": {
       "version": "1.37.0",
@@ -39,11 +39,11 @@
       "status": "available"
     },
     "jq": {
-      "version": "1.7.1-r1",
+      "version": "1.7.1-r2",
       "description": "Lightweight command-line JSON processor",
-      "url": "https://linuxontab.com/packages/jq-1.7.1-r1.tar.gz",
-      "size": 265640,
-      "sha256": "b8eb96ccee0b4a40499148567e5e5a6ee8f1e38fa31d228d6f9db993d825fd41",
+      "url": "https://linuxontab.com/packages/jq-1.7.1-r2.tar.gz",
+      "size": 267630,
+      "sha256": "8ab4e16274855215e9a0ffbff1a652ffe80ecefee748e31bb66bfe90b9190200",
       "bins": [
         "jq"
       ],
